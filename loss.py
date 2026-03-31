@@ -594,6 +594,409 @@ class PhaseLoss(nn.Module):
         return loss
 
 
+# =============================================================================
+# V2 UPGRADES: Psychoacoustic Loud-Loss
+# =============================================================================
+
+class PsychoacousticLoudLoss(nn.Module):
+    """
+    Psychoacoustic Loudness-Weighted Loss.
+    
+    BIOMIMETIC RATIONALE:
+    Human hearing does not perceive all frequencies equally. The equal-loudness
+    contours (ISO 226) show that:
+    - Ears are most sensitive around 2-5 kHz (speech consonants)
+    - Low frequencies require more energy to be perceived
+    - Very high frequencies have reduced sensitivity
+    
+    This loss weights errors by perceptual importance, ensuring that
+    perceptually significant frequencies are prioritized.
+    
+    FORMULA:
+        L_loud = Σ W(f) * || log(P + ε) - log(P̂ + ε) ||²
+    
+    Where:
+        - W(f) = frequency weighting (A-weighting or equal-loudness approximation)
+        - P = power spectrum of target
+        - P̂ = power spectrum of prediction
+        - ε = stability constant (1e-6)
+    
+    LOG DOMAIN RATIONALE:
+    - Human loudness perception is roughly logarithmic
+    - Log domain compresses dynamic range naturally
+    - Errors in quiet regions are weighted appropriately
+    """
+    
+    def __init__(
+        self,
+        n_fft: int = 256,
+        sample_rate: int = 16000,
+        weighting: str = "a_weighting",  # "a_weighting", "equal_loudness", "flat"
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        
+        self.n_fft = n_fft
+        self.sample_rate = sample_rate
+        self.eps = eps
+        self.weighting = weighting
+        
+        # Pre-compute frequency weighting curve
+        n_freqs = n_fft // 2 + 1
+        freqs = torch.linspace(0, sample_rate / 2, n_freqs)
+        
+        if weighting == "a_weighting":
+            weights = self._compute_a_weighting(freqs)
+        elif weighting == "equal_loudness":
+            weights = self._compute_equal_loudness(freqs)
+        else:
+            weights = torch.ones(n_freqs)
+        
+        # Normalize weights to sum to n_freqs (preserve loss scale)
+        weights = weights / weights.mean()
+        
+        self.register_buffer("freq_weights", weights.view(1, 1, 1, -1))
+        
+    def _compute_a_weighting(self, freqs: torch.Tensor) -> torch.Tensor:
+        """
+        Compute A-weighting curve.
+        
+        A-weighting approximates human hearing sensitivity at moderate levels.
+        Based on IEC 61672:2003.
+        """
+        f = freqs.clamp(min=1.0)  # Avoid division by zero
+        
+        # A-weighting formula (simplified)
+        f2 = f ** 2
+        
+        num = 12194 ** 2 * f2 ** 2
+        denom = (f2 + 20.6 ** 2) * torch.sqrt((f2 + 107.7 ** 2) * (f2 + 737.9 ** 2)) * (f2 + 12194 ** 2)
+        
+        a_weight = num / (denom + 1e-8)
+        
+        # Normalize (0 dB at 1kHz reference)
+        ref_idx = torch.argmin(torch.abs(f - 1000))
+        a_weight = a_weight / (a_weight[ref_idx] + 1e-8)
+        
+        return a_weight.clamp(min=0.01)  # Prevent zero weights
+        
+    def _compute_equal_loudness(self, freqs: torch.Tensor) -> torch.Tensor:
+        """
+        Compute equal-loudness contour approximation at 60 phon.
+        
+        Based on ISO 226:2003 equal-loudness contours.
+        """
+        f = freqs.clamp(min=20.0)  # Audible range
+        
+        # Simplified equal-loudness approximation
+        # Peaks around 3-4 kHz, rolls off at extremes
+        center = 3500.0
+        width = 2.5  # Octaves
+        
+        log_ratio = torch.log2(f / center)
+        weights = torch.exp(-0.5 * (log_ratio / width) ** 2)
+        
+        # Add low-frequency roll-off
+        lf_rolloff = torch.sigmoid((f - 100) / 50)
+        weights = weights * lf_rolloff
+        
+        # Add high-frequency roll-off
+        hf_rolloff = torch.sigmoid((8000 - f) / 500)
+        weights = weights * hf_rolloff
+        
+        return weights.clamp(min=0.1)
+        
+    def forward(
+        self,
+        pred_stft: torch.Tensor,
+        target_stft: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute psychoacoustic loudness-weighted loss.
+        
+        Args:
+            pred_stft: Predicted complex STFT [B, 2, T, F]
+            target_stft: Target complex STFT [B, 2, T, F]
+            
+        Returns:
+            Weighted log-power loss scalar
+        """
+        # Compute power spectra
+        pred_power = pred_stft[:, 0, :, :] ** 2 + pred_stft[:, 1, :, :] ** 2
+        target_power = target_stft[:, 0, :, :] ** 2 + target_stft[:, 1, :, :] ** 2
+        
+        # Log domain (with stability constant)
+        pred_log = torch.log(pred_power + self.eps)
+        target_log = torch.log(target_power + self.eps)
+        
+        # Squared error in log domain
+        log_error = (pred_log - target_log) ** 2
+        
+        # Apply frequency weighting
+        # Handle frequency dimension mismatch
+        F = log_error.shape[-1]
+        if self.freq_weights.shape[-1] != F:
+            weights = F_nn.interpolate(
+                self.freq_weights.squeeze(0),
+                size=F,
+                mode='linear',
+                align_corners=False
+            ).unsqueeze(0)
+        else:
+            weights = self.freq_weights
+        
+        weighted_error = log_error.unsqueeze(1) * weights  # [B, 1, T, F]
+        
+        # Mean over all dimensions
+        loss = weighted_error.mean()
+        
+        return loss
+
+
+# Alias for F module in loss context
+F_nn = nn.functional
+
+
+class SISDRLoss(nn.Module):
+    """
+    Scale-Invariant Signal-to-Distortion Ratio loss.
+    
+    Improved version of SI-SNR with better gradient properties.
+    Commonly used in state-of-the-art speech enhancement.
+    
+    SI-SDR = 10 * log10(||s_target||² / ||e||²)
+    
+    Where:
+        s_target = (<s, s_ref> / ||s_ref||²) * s_ref
+        e = s - s_target
+    """
+    
+    def __init__(self, eps: float = 1e-8, reduction: str = "mean"):
+        super().__init__()
+        self.eps = eps
+        self.reduction = reduction
+        
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            pred: Predicted waveform [B, N]
+            target: Target waveform [B, N]
+            
+        Returns:
+            Negative SI-SDR (for minimization)
+        """
+        # Ensure 2D
+        if pred.dim() == 3:
+            pred = pred.squeeze(1)
+        if target.dim() == 3:
+            target = target.squeeze(1)
+        
+        # Ensure same length
+        min_len = min(pred.shape[-1], target.shape[-1])
+        pred = pred[..., :min_len]
+        target = target[..., :min_len]
+        
+        # Zero-mean
+        pred = pred - pred.mean(dim=-1, keepdim=True)
+        target = target - target.mean(dim=-1, keepdim=True)
+        
+        # Compute SI-SDR
+        # s_target = (<s, s_ref> / ||s_ref||²) * s_ref
+        dot = torch.sum(pred * target, dim=-1, keepdim=True)
+        s_ref_norm = torch.sum(target ** 2, dim=-1, keepdim=True) + self.eps
+        s_target = (dot / s_ref_norm) * target
+        
+        # e = s - s_target
+        e = pred - s_target
+        
+        # SI-SDR = 10 * log10(||s_target||² / ||e||²)
+        si_sdr = torch.sum(s_target ** 2, dim=-1) / (torch.sum(e ** 2, dim=-1) + self.eps)
+        si_sdr_db = 10 * torch.log10(si_sdr + self.eps)
+        
+        if self.reduction == "mean":
+            return -si_sdr_db.mean()
+        elif self.reduction == "sum":
+            return -si_sdr_db.sum()
+        else:
+            return -si_sdr_db
+
+
+# =============================================================================
+# V2 Combined Loss with Psychoacoustic Weighting
+# =============================================================================
+
+class AuraNetV2Loss(nn.Module):
+    """
+    AuraNet V2 Loss: Psychoacoustically-informed multi-task loss.
+    
+    UPGRADES FROM V1:
+    1. Psychoacoustic Loud-Loss (frequency-weighted log-power)
+    2. SI-SDR for time-domain supervision
+    3. Configurable loss combination for 2-stage training
+    
+    LOSS COMPONENTS:
+    - Loud-Loss: Perceptually-weighted frequency domain
+    - SI-SDR: Scale-invariant time domain
+    - Multi-Resolution STFT: Spectral envelope matching
+    - Temporal Coherence: Artifact prevention
+    
+    2-STAGE TRAINING:
+    Stage 1 (Separation): High weight on loud-loss + SI-SDR
+    Stage 2 (WDRC Fine-tune): Add dynamics-focused losses
+    """
+    
+    def __init__(
+        self,
+        # Loss weights
+        weight_loud: float = 1.0,
+        weight_si_sdr: float = 0.5,
+        weight_stft: float = 0.3,
+        weight_temporal: float = 0.1,
+        weight_phase: float = 0.1,
+        # Configuration
+        sample_rate: int = 16000,
+        n_fft: int = 256,
+        loudness_weighting: str = "a_weighting",
+        # Stage control
+        stage: int = 1,  # 1 = separation, 2 = WDRC fine-tune
+    ):
+        super().__init__()
+        
+        self.stage = stage
+        
+        # Store weights (can be modified for stage 2)
+        self.weight_loud = weight_loud
+        self.weight_si_sdr = weight_si_sdr
+        self.weight_stft = weight_stft
+        self.weight_temporal = weight_temporal
+        self.weight_phase = weight_phase
+        
+        # Loss components
+        self.loud_loss = PsychoacousticLoudLoss(
+            n_fft=n_fft,
+            sample_rate=sample_rate,
+            weighting=loudness_weighting,
+        )
+        
+        self.si_sdr_loss = SISDRLoss()
+        
+        self.stft_loss = MultiResolutionSTFTLoss(
+            fft_sizes=[256, 512, 1024],
+            hop_sizes=[64, 128, 256],
+            win_lengths=[256, 512, 1024],
+        )
+        
+        self.temporal_loss = TemporalCoherenceLoss()
+        self.phase_loss = PhaseLoss()
+        
+        # WDRC-specific loss (Stage 2 only)
+        self.loudness_envelope_loss = LoudnessEnvelopeLoss()
+        
+    def set_stage(self, stage: int) -> None:
+        """
+        Set training stage and adjust weights accordingly.
+        
+        Stage 1: Focus on separation quality
+        Stage 2: Fine-tune with WDRC for dynamics
+        """
+        self.stage = stage
+        
+        if stage == 1:
+            # Separation-focused weights
+            self.weight_loud = 1.0
+            self.weight_si_sdr = 0.5
+            self.weight_stft = 0.3
+            self.weight_temporal = 0.1
+            self.weight_phase = 0.1
+        elif stage == 2:
+            # WDRC fine-tuning weights (reduce separation, add envelope)
+            self.weight_loud = 0.5
+            self.weight_si_sdr = 0.3
+            self.weight_stft = 0.2
+            self.weight_temporal = 0.2
+            self.weight_phase = 0.1
+            
+    def forward(
+        self,
+        pred_stft: torch.Tensor,
+        target_stft: torch.Tensor,
+        pred_audio: Optional[torch.Tensor] = None,
+        target_audio: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute combined V2 loss.
+        
+        Args:
+            pred_stft: Predicted complex STFT [B, 2, T, F]
+            target_stft: Target complex STFT [B, 2, T, F]
+            pred_audio: Predicted waveform [B, N] (optional)
+            target_audio: Target waveform [B, N] (optional)
+            
+        Returns:
+            Tuple of:
+            - total_loss: Weighted sum of all losses
+            - loss_dict: Dictionary with individual loss values
+        """
+        loss_dict = {}
+        
+        # 1. Psychoacoustic Loud-Loss (frequency domain)
+        loss_loud = self.loud_loss(pred_stft, target_stft)
+        loss_dict["loud_loss"] = loss_loud
+        
+        # 2. Temporal coherence (STFT domain)
+        loss_temporal = self.temporal_loss(pred_stft, target_stft)
+        loss_dict["temporal_loss"] = loss_temporal
+        
+        # 3. Phase loss (STFT domain)
+        loss_phase = self.phase_loss(pred_stft, target_stft)
+        loss_dict["phase_loss"] = loss_phase
+        
+        # 4. Time-domain losses (if audio available)
+        if pred_audio is not None and target_audio is not None:
+            # SI-SDR
+            loss_si_sdr = self.si_sdr_loss(pred_audio, target_audio)
+            loss_dict["si_sdr_loss"] = loss_si_sdr
+            
+            # Multi-resolution STFT
+            loss_stft = self.stft_loss(pred_audio, target_audio)
+            loss_dict["stft_loss"] = loss_stft
+            
+            # Loudness envelope (Stage 2)
+            if self.stage == 2:
+                loss_envelope = self.loudness_envelope_loss(pred_audio, target_audio)
+                loss_dict["envelope_loss"] = loss_envelope
+            else:
+                loss_envelope = torch.tensor(0.0, device=pred_stft.device)
+        else:
+            loss_si_sdr = torch.tensor(0.0, device=pred_stft.device)
+            loss_stft = torch.tensor(0.0, device=pred_stft.device)
+            loss_envelope = torch.tensor(0.0, device=pred_stft.device)
+            loss_dict["si_sdr_loss"] = loss_si_sdr
+            loss_dict["stft_loss"] = loss_stft
+        
+        # Compute weighted total
+        total_loss = (
+            self.weight_loud * loss_loud +
+            self.weight_si_sdr * loss_si_sdr +
+            self.weight_stft * loss_stft +
+            self.weight_temporal * loss_temporal +
+            self.weight_phase * loss_phase
+        )
+        
+        # Add envelope loss in Stage 2
+        if self.stage == 2 and not isinstance(loss_envelope, float):
+            total_loss = total_loss + 0.3 * loss_envelope
+            loss_dict["envelope_loss"] = loss_envelope
+        
+        loss_dict["total"] = total_loss
+        
+        return total_loss, loss_dict
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Testing AuraNet Loss Functions")
