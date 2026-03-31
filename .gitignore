@@ -1,0 +1,94 @@
+# =============================================================================
+# AuraNet .gitignore
+# =============================================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# =============================================================================
+# PROJECT SPECIFIC - Large files (keep in Google Drive, not Git)
+# =============================================================================
+
+# Model checkpoints (too large for Git)
+checkpoints/*.pt
+checkpoints/*.pth
+checkpoints/*.onnx
+*.pt
+*.pth
+*.onnx
+
+# Exported models
+exported_models/
+
+# Audio datasets (too large for Git)
+datasets/
+data/
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+
+# Training outputs
+outputs/
+logs/
+runs/
+tensorboard/
+
+# =============================================================================
+# EXCEPTIONS - Files to KEEP in Git
+# =============================================================================
+
+# Keep sample/test files if small
+!tests/fixtures/*.wav
+
+# Keep example configs
+!config.yaml
+!config_example.yaml
