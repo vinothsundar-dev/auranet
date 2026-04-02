@@ -1,0 +1,46 @@
+# =============================================================================
+# AuraNet V3 Configuration
+# =============================================================================
+
+audio:
+  sample_rate: 16000
+
+stft:
+  window_size: 160    # 10ms @ 16kHz
+  hop_size: 80        # 5ms (50% overlap)
+  n_fft: 256          # 129 frequency bins
+
+model:
+  encoder:
+    channels: [16, 32, 64, 128]
+  decoder:
+    channels: [128, 64, 32, 16, 2]
+  bottleneck:
+    hidden_size: 128   # V3: smaller hidden, more layers
+    num_layers: 2       # V3: 2-layer GRU
+    dropout: 0.1
+
+loss:
+  si_snr: 1.0              # Primary: scale-invariant SNR
+  compressed_mse: 0.5      # Power-law compressed complex MSE
+  multi_res_stft: 0.3      # Multi-resolution spectral matching
+  compress_factor: 0.3     # Power compression exponent
+
+training:
+  batch_size: 16
+  num_epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.01
+  gradient_clip: 5.0
+  warmup_epochs: 5
+  lr_patience: 5           # ReduceLROnPlateau patience
+  early_stop_patience: 15
+  use_amp: true
+  checkpoint_dir: checkpoints
+  segment_length: 3.0
+  num_synthetic_samples: 2000
+
+export:
+  onnx:
+    opset_version: 17
+    dynamic_axes: true
