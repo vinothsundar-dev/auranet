@@ -367,6 +367,7 @@ class AuraNetV3Dataset(Dataset):
         self.clipping_prob = clipping_prob
 
         self.stft = CausalSTFT(n_fft=n_fft, hop_length=hop_length, win_length=win_length)
+        self.return_stft = True  # Set False to return audio-only (GPU STFT in training loop)
 
         # Load real RIR files if directory provided
         self.rir_files = []
@@ -542,17 +543,24 @@ class AuraNetV3Dataset(Dataset):
         if noisy_audio.dim() == 1:
             noisy_audio = noisy_audio.unsqueeze(0)
 
-        # STFT
-        noisy_stft = self.stft(noisy_audio).squeeze(0)  # [2, T, F]
-        clean_stft = self.stft(clean_audio).squeeze(0)
-
-        return {
-            "noisy_stft": noisy_stft,
-            "clean_stft": clean_stft,
-            "noisy_audio": noisy_audio.squeeze(0),
-            "clean_audio": clean_audio.squeeze(0),
-            "snr": torch.tensor(snr),
-        }
+        if self.return_stft:
+            # CPU STFT (legacy mode — works but slower)
+            noisy_stft = self.stft(noisy_audio).squeeze(0)  # [2, T, F]
+            clean_stft = self.stft(clean_audio).squeeze(0)
+            return {
+                "noisy_stft": noisy_stft,
+                "clean_stft": clean_stft,
+                "noisy_audio": noisy_audio.squeeze(0),
+                "clean_audio": clean_audio.squeeze(0),
+                "snr": torch.tensor(snr),
+            }
+        else:
+            # Audio-only mode — STFT computed on GPU in training loop (faster)
+            return {
+                "noisy_audio": noisy_audio.squeeze(0),
+                "clean_audio": clean_audio.squeeze(0),
+                "snr": torch.tensor(snr),
+            }
 
 
 def create_v3_dataloader(clean_dir, noise_dir, batch_size=16, num_workers=2,
