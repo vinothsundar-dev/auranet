@@ -369,6 +369,9 @@ class AuraNetV3Dataset(Dataset):
         self.stft = CausalSTFT(n_fft=n_fft, hop_length=hop_length, win_length=win_length)
         self.return_stft = True  # Set False to return audio-only (GPU STFT in training loop)
 
+        # In-memory audio cache: path → tensor (eliminates disk I/O after first load)
+        self._audio_cache = {}
+
         # Load real RIR files if directory provided
         self.rir_files = []
         if rir_dir is not None:
@@ -402,6 +405,44 @@ class AuraNetV3Dataset(Dataset):
         for ext in ("*.wav", "*.flac", "*.mp3", "*.ogg"):
             files.extend(glob.glob(str(directory / "**" / ext), recursive=True))
         return sorted(files)
+
+    def _load_cached(self, path: str) -> torch.Tensor:
+        """Load audio with in-memory cache. First call reads disk, subsequent calls use RAM."""
+        if path in self._audio_cache:
+            return self._audio_cache[path].clone()
+        waveform, _ = load_audio(path, self.sample_rate)
+        self._audio_cache[path] = waveform
+        return waveform.clone()
+
+    def preload_audio(self):
+        """Pre-load all audio files into RAM. Call before training to eliminate disk I/O."""
+        import time
+        t0 = time.time()
+        total = len(self.clean_files) + len(self.noise_files)
+        loaded = 0
+        for path in self.clean_files:
+            if isinstance(path, str):
+                try:
+                    waveform, _ = load_audio(path, self.sample_rate)
+                    self._audio_cache[path] = waveform
+                except Exception:
+                    pass
+            loaded += 1
+            if loaded % 2000 == 0:
+                print(f"   Preloading... {loaded}/{total} ({loaded*100//total}%)")
+        for path in self.noise_files:
+            if isinstance(path, str):
+                try:
+                    waveform, _ = load_audio(path, self.sample_rate)
+                    self._audio_cache[path] = waveform
+                except Exception:
+                    pass
+            loaded += 1
+            if loaded % 2000 == 0:
+                print(f"   Preloading... {loaded}/{total} ({loaded*100//total}%)")
+        elapsed = time.time() - t0
+        cache_mb = sum(v.nelement() * 4 for v in self._audio_cache.values()) / (1024**2)
+        print(f"   ✅ Preloaded {len(self._audio_cache)} files ({cache_mb:.0f} MB) in {elapsed:.1f}s")
 
     # ------------------------------------------------------------------
     # Synthetic generators (unchanged from V1, kept for completeness)
@@ -485,9 +526,9 @@ class AuraNetV3Dataset(Dataset):
             noise_audio = self._generate_synthetic_noise()
         else:
             clean_path = self.clean_files[idx]
-            clean_audio, _ = load_audio(clean_path, self.sample_rate)
+            clean_audio = self._load_cached(clean_path)
             noise_idx = random.randint(0, len(self.noise_files) - 1)
-            noise_audio, _ = load_audio(self.noise_files[noise_idx], self.sample_rate)
+            noise_audio = self._load_cached(self.noise_files[noise_idx])
 
         # Crop to segment length (with wrap-padding for short clips)
         clean_audio = self._safe_crop(clean_audio, self.segment_samples)
