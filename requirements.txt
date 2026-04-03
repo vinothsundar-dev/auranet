@@ -13,9 +13,9 @@ pyyaml>=6.0
 onnx>=1.14.0
 onnxruntime>=1.15.0
 
-# Optional: Audio quality metrics
-# pesq>=0.0.4
-# pystoi>=0.3.3
+# Audio quality metrics (PESQ/STOI — production evaluation)
+pesq>=0.0.4
+pystoi>=0.3.3
 
 # Development
 numpy>=1.21.0

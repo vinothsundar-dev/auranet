@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import random
 import glob
 import math
+import numpy as np
 
 from utils.stft import CausalSTFT
 from utils.audio_utils import (
@@ -29,6 +30,296 @@ from utils.audio_utils import (
     apply_random_gain,
     generate_synthetic_noise,
 )
+
+
+# =============================================================================
+# Production Augmentations: RIR, Codec simulation, Bandwidth limitation
+# =============================================================================
+
+def generate_synthetic_rir(length: int = 4000, sample_rate: int = 16000,
+                           rt60: float = 0.0,
+                           room_size: str = '') -> torch.Tensor:
+    """
+    Generate a synthetic room impulse response (RIR).
+
+    Uses exponentially decaying noise shaped by a target RT60.
+    Optionally selects RT60 based on room_size preset.
+
+    Args:
+        length: RIR length in samples (default 4000 = 250ms @ 16kHz)
+        sample_rate: Audio sample rate
+        rt60: Reverberation time in seconds (0 = random or room_size-based)
+        room_size: 'small' (0.1-0.3s), 'medium' (0.3-0.6s), 'large' (0.5-1.0s),
+                   'car' (0.05-0.15s), '' = random from all
+
+    Returns:
+        RIR tensor [1, length], normalized so max(abs) = 1
+    """
+    if rt60 <= 0:
+        if room_size == 'small':
+            rt60 = random.uniform(0.1, 0.3)
+        elif room_size == 'medium':
+            rt60 = random.uniform(0.3, 0.6)
+        elif room_size == 'large':
+            rt60 = random.uniform(0.5, 1.0)
+        elif room_size == 'car':
+            rt60 = random.uniform(0.05, 0.15)
+        else:
+            # Random room: weighted toward smaller rooms (more common)
+            rt60 = random.choice([
+                random.uniform(0.05, 0.15),  # car
+                random.uniform(0.1, 0.3),    # small room
+                random.uniform(0.1, 0.3),    # small room (double weight)
+                random.uniform(0.3, 0.6),    # medium room
+                random.uniform(0.5, 1.0),    # large room
+            ])
+
+    # Exponential decay envelope: amplitude drops to -60dB at t=RT60
+    t = torch.arange(length, dtype=torch.float32) / sample_rate
+    decay = torch.exp(-6.908 * t / max(rt60, 0.01))  # ln(1000) ≈ 6.908
+
+    # Shape noise with decay
+    rir = torch.randn(length) * decay
+
+    # Direct path is always the strongest
+    rir[0] = 1.0
+
+    # Early reflections (2-10 discrete reflections in first 20ms)
+    n_early = random.randint(2, 10)
+    early_end = min(int(0.02 * sample_rate), length)
+    for _ in range(n_early):
+        pos = random.randint(1, max(1, early_end - 1))
+        rir[pos] += random.uniform(0.2, 0.7) * random.choice([-1, 1])
+
+    # Normalize
+    rir = rir / (rir.abs().max() + 1e-8)
+    return rir.unsqueeze(0)  # [1, length]
+
+
+def apply_rir(audio: torch.Tensor, rir: Optional[torch.Tensor] = None,
+              sample_rate: int = 16000) -> torch.Tensor:
+    """
+    Apply room impulse response to audio via convolution.
+
+    Pipeline: clean → convolve(clean, rir)[:len(clean)] → energy-match
+
+    Args:
+        audio: [1, N] or [N] waveform
+        rir: [1, L] impulse response. None = generate random synthetic RIR.
+        sample_rate: Audio sample rate
+
+    Returns:
+        Reverberant audio, same shape as input, energy-matched and clipped to [-1, 1].
+    """
+    was_1d = audio.dim() == 1
+    if was_1d:
+        audio = audio.unsqueeze(0)
+
+    if rir is None:
+        rir = generate_synthetic_rir(sample_rate=sample_rate)
+
+    # Convolve: audio [1, N] with rir [1, L]
+    orig_energy = torch.sqrt(torch.mean(audio ** 2) + 1e-8)
+    reverb = F.conv1d(
+        audio.unsqueeze(0),           # [1, 1, N]
+        rir.unsqueeze(0),             # [1, 1, L]
+        padding=rir.shape[-1] - 1,
+    ).squeeze(0)                      # [1, N + L - 1]
+
+    # Trim to original length
+    reverb = reverb[..., :audio.shape[-1]]
+
+    # Energy-match to avoid loudness change
+    reverb_energy = torch.sqrt(torch.mean(reverb ** 2) + 1e-8)
+    reverb = reverb * (orig_energy / (reverb_energy + 1e-8))
+
+    # Normalize to [-1, 1]
+    peak = reverb.abs().max()
+    if peak > 1.0:
+        reverb = reverb / peak
+
+    if was_1d:
+        reverb = reverb.squeeze(0)
+    return reverb
+
+
+def apply_lowpass(audio: torch.Tensor, cutoff_hz: int = 0,
+                  sample_rate: int = 16000) -> torch.Tensor:
+    """
+    Apply low-pass filter to simulate bandwidth limitation.
+
+    Simulates telephone (3-4kHz), mobile (6kHz), or VoIP (8kHz) conditions.
+
+    Args:
+        audio: [1, N] or [N] waveform
+        cutoff_hz: Cutoff frequency. 0 = random from [3000, 4000, 6000, 8000].
+        sample_rate: Audio sample rate
+
+    Returns:
+        Filtered audio, same shape.
+    """
+    if cutoff_hz <= 0:
+        cutoff_hz = random.choice([3000, 4000, 6000, 8000])
+    normalized_cutoff = cutoff_hz / (sample_rate / 2.0)
+    if normalized_cutoff >= 1.0:
+        return audio
+
+    was_1d = audio.dim() == 1
+    if was_1d:
+        audio = audio.unsqueeze(0)
+
+    # Windowed-sinc FIR low-pass filter
+    filter_len = 101  # longer filter = sharper cutoff
+    half = filter_len // 2
+    n = torch.arange(filter_len, dtype=torch.float32) - half
+    h = torch.where(
+        n == 0,
+        torch.tensor(2.0 * normalized_cutoff),
+        torch.sin(2.0 * math.pi * normalized_cutoff * n) / (math.pi * n + 1e-12),
+    )
+    window = torch.hamming_window(filter_len, dtype=torch.float32)
+    h = h * window
+    h = h / h.sum()
+
+    h = h.to(audio.device)
+    filtered = F.conv1d(
+        audio.unsqueeze(0),
+        h.view(1, 1, -1),
+        padding=half,
+    ).squeeze(0)
+
+    filtered = filtered[..., :audio.shape[-1]]
+    if was_1d:
+        filtered = filtered.squeeze(0)
+    return filtered
+
+
+def apply_resample(audio: torch.Tensor, target_sr: int = 0,
+                   sample_rate: int = 16000) -> torch.Tensor:
+    """
+    Simulate codec resampling: downsample then upsample back.
+
+    16kHz → target_sr → 16kHz introduces aliasing and quality loss
+    typical of phone codecs (AMR-NB: 8kHz, AMR-WB: 16kHz, SILK: 12kHz).
+
+    Args:
+        audio: [1, N] or [N] waveform at sample_rate
+        target_sr: Intermediate sample rate. 0 = random from [8000, 12000].
+        sample_rate: Original sample rate
+
+    Returns:
+        Degraded audio at original sample_rate, same shape.
+    """
+    if target_sr <= 0:
+        target_sr = random.choice([8000, 12000])
+    if target_sr >= sample_rate:
+        return audio
+
+    was_1d = audio.dim() == 1
+    if was_1d:
+        audio = audio.unsqueeze(0)
+
+    orig_len = audio.shape[-1]
+    # Downsample
+    down_len = int(orig_len * target_sr / sample_rate)
+    downsampled = F.interpolate(
+        audio.unsqueeze(0), size=down_len, mode='linear', align_corners=False
+    ).squeeze(0)
+    # Upsample back
+    upsampled = F.interpolate(
+        downsampled.unsqueeze(0), size=orig_len, mode='linear', align_corners=False
+    ).squeeze(0)
+
+    if was_1d:
+        upsampled = upsampled.squeeze(0)
+    return upsampled
+
+
+def apply_clipping(audio: torch.Tensor, clip_level: float = 0.0) -> torch.Tensor:
+    """
+    Simulate microphone clipping / digital saturation.
+
+    Args:
+        audio: Waveform tensor
+        clip_level: Clipping threshold (0 = random between 0.3 and 0.8 of peak)
+
+    Returns:
+        Clipped audio.
+    """
+    if clip_level <= 0:
+        peak = audio.abs().max().item()
+        clip_level = peak * random.uniform(0.3, 0.8)
+    return torch.clamp(audio, -clip_level, clip_level)
+
+
+def apply_quantization(audio: torch.Tensor, bits: int = 0) -> torch.Tensor:
+    """
+    Simulate low-bitrate quantization noise.
+
+    Reduces effective bit depth to simulate lossy codec artifacts.
+
+    Args:
+        audio: Waveform tensor (expected in [-1, 1] range)
+        bits: Effective bits. 0 = random from [6, 7, 8] (64-256 levels).
+              8 bits ≈ μ-law telephone, 6 bits ≈ aggressive compression.
+
+    Returns:
+        Quantized audio with stepped waveform artifacts.
+    """
+    if bits <= 0:
+        bits = random.choice([6, 7, 8])
+    levels = 2 ** bits
+    return torch.round(audio * levels) / levels
+
+
+def apply_codec_chain(audio: torch.Tensor, sample_rate: int = 16000,
+                      lowpass_prob: float = 0.5,
+                      resample_prob: float = 0.3,
+                      clipping_prob: float = 0.1,
+                      quantization_prob: float = 0.2) -> torch.Tensor:
+    """
+    Apply a random chain of codec degradations.
+
+    Each effect is applied independently with its own probability.
+    This simulates real-world audio that passes through multiple processing
+    stages (mic → codec → network → decoder → speaker).
+
+    Args:
+        audio: Waveform tensor
+        sample_rate: Audio sample rate
+        lowpass_prob: Probability of bandwidth limitation
+        resample_prob: Probability of downsample/upsample cycle
+        clipping_prob: Probability of clipping distortion
+        quantization_prob: Probability of bit-depth reduction
+
+    Returns:
+        Degraded audio, same shape. Normalized to [-1, 1].
+    """
+    if random.random() < lowpass_prob:
+        audio = apply_lowpass(audio, sample_rate=sample_rate)
+
+    if random.random() < resample_prob:
+        audio = apply_resample(audio, sample_rate=sample_rate)
+
+    if random.random() < clipping_prob:
+        audio = apply_clipping(audio)
+
+    if random.random() < quantization_prob:
+        audio = apply_quantization(audio)
+
+    # Normalize to [-1, 1]
+    peak = audio.abs().max()
+    if peak > 1.0:
+        audio = audio / peak
+
+    return audio
+
+
+# Legacy alias for backward compatibility
+def apply_bandwidth_limitation(audio: torch.Tensor,
+                               sample_rate: int = 16000) -> torch.Tensor:
+    """Backward-compatible wrapper. Use apply_lowpass() for new code."""
+    return apply_lowpass(audio, sample_rate=sample_rate)
 
 
 class AuraNetV3Dataset(Dataset):
@@ -46,6 +337,7 @@ class AuraNetV3Dataset(Dataset):
         self,
         clean_dir: Optional[Union[str, Path]] = None,
         noise_dir: Optional[Union[str, Path]] = None,
+        rir_dir: Optional[Union[str, Path]] = None,
         sample_rate: int = 16000,
         segment_length: float = 3.0,
         snr_range: Tuple[float, float] = (-5.0, 25.0),
@@ -56,6 +348,10 @@ class AuraNetV3Dataset(Dataset):
         synthetic_mode: bool = False,
         num_synthetic_samples: int = 1000,
         speed_perturb: bool = True,
+        rir_prob: float = 0.3,
+        codec_prob: float = 0.2,
+        bandwidth_prob: float = 0.15,
+        clipping_prob: float = 0.05,
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -65,8 +361,24 @@ class AuraNetV3Dataset(Dataset):
         self.synthetic_mode = synthetic_mode
         self.num_synthetic_samples = num_synthetic_samples
         self.speed_perturb = speed_perturb
+        self.rir_prob = rir_prob
+        self.codec_prob = codec_prob
+        self.bandwidth_prob = bandwidth_prob
+        self.clipping_prob = clipping_prob
 
         self.stft = CausalSTFT(n_fft=n_fft, hop_length=hop_length, win_length=win_length)
+
+        # Load real RIR files if directory provided
+        self.rir_files = []
+        if rir_dir is not None:
+            rir_path = Path(rir_dir)
+            if rir_path.exists():
+                for ext in ("*.wav", "*.flac"):
+                    self.rir_files.extend(
+                        glob.glob(str(rir_path / "**" / ext), recursive=True)
+                    )
+                if self.rir_files:
+                    print(f"   RIR augmentation: {len(self.rir_files)} real RIRs loaded")
 
         if synthetic_mode:
             self.clean_files = list(range(num_synthetic_samples))
@@ -180,14 +492,49 @@ class AuraNetV3Dataset(Dataset):
         clean_audio = self._safe_crop(clean_audio, self.segment_samples)
         noise_audio = self._safe_crop(noise_audio, self.segment_samples)
 
-        # Augmentation
+        # ================================================================
+        # Augmentation pipeline:
+        #   clean → gain → speed → RIR → codec degradation → mix → clip
+        # ================================================================
         if self.augment:
+            # 1. Random gain
             clean_audio = apply_random_gain(clean_audio, -6.0, 6.0)
+
+            # 2. Speed perturbation
             clean_audio = self._random_speed(clean_audio)
 
-        # Biased SNR mixing
+            # 3. RIR augmentation — apply reverb to clean speech
+            if random.random() < self.rir_prob:
+                if self.rir_files:
+                    rir_path = random.choice(self.rir_files)
+                    try:
+                        rir_audio, _ = load_audio(rir_path, self.sample_rate)
+                        if rir_audio.dim() == 1:
+                            rir_audio = rir_audio.unsqueeze(0)
+                        rir_audio = rir_audio[..., :8000]  # max 500ms
+                        clean_audio = apply_rir(clean_audio, rir_audio, self.sample_rate)
+                    except Exception:
+                        clean_audio = apply_rir(clean_audio, None, self.sample_rate)
+                else:
+                    clean_audio = apply_rir(clean_audio, None, self.sample_rate)
+
+            # 4. Codec degradation chain (lowpass + resample + quantization)
+            if random.random() < self.codec_prob:
+                clean_audio = apply_codec_chain(clean_audio, self.sample_rate)
+                noise_audio = apply_codec_chain(noise_audio, self.sample_rate)
+
+            # 4b. Standalone bandwidth limitation (separate from full codec chain)
+            elif random.random() < self.bandwidth_prob:
+                clean_audio = apply_lowpass(clean_audio, sample_rate=self.sample_rate)
+                noise_audio = apply_lowpass(noise_audio, sample_rate=self.sample_rate)
+
+        # 5. Biased SNR mixing
         snr = self._biased_snr()
         noisy_audio, _ = mix_audio_with_noise(clean_audio, noise_audio, snr)
+
+        # 6. Clipping — applied AFTER mixing (simulates mic overload)
+        if self.augment and random.random() < self.clipping_prob:
+            noisy_audio = apply_clipping(noisy_audio)
 
         # Ensure shape [1, N]
         if clean_audio.dim() == 1:
