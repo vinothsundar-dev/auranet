@@ -407,42 +407,63 @@ class AuraNetV3Dataset(Dataset):
         return sorted(files)
 
     def _load_cached(self, path: str) -> torch.Tensor:
-        """Load audio with in-memory cache. First call reads disk, subsequent calls use RAM."""
+        """Load audio with LRU-style cache, capped at max_cache_mb."""
         if path in self._audio_cache:
             return self._audio_cache[path].clone()
         waveform, _ = load_audio(path, self.sample_rate)
-        self._audio_cache[path] = waveform
+        # Only cache if under memory limit (default 4 GB)
+        cache_bytes = sum(v.nelement() * 4 for v in self._audio_cache.values())
+        max_bytes = getattr(self, '_max_cache_mb', 4096) * 1024 * 1024
+        if cache_bytes < max_bytes:
+            self._audio_cache[path] = waveform
         return waveform.clone()
 
-    def preload_audio(self):
-        """Pre-load all audio files into RAM. Call before training to eliminate disk I/O."""
+    def preload_audio(self, max_gb: float = 4.0):
+        """Pre-load audio into RAM up to max_gb limit. Safe for Kaggle (13GB RAM)."""
         import time
+        self._max_cache_mb = int(max_gb * 1024)
         t0 = time.time()
         total = len(self.clean_files) + len(self.noise_files)
         loaded = 0
-        for path in self.clean_files:
-            if isinstance(path, str):
-                try:
-                    waveform, _ = load_audio(path, self.sample_rate)
-                    self._audio_cache[path] = waveform
-                except Exception:
-                    pass
-            loaded += 1
-            if loaded % 2000 == 0:
-                print(f"   Preloading... {loaded}/{total} ({loaded*100//total}%)")
+        cache_bytes = 0
+        max_bytes = int(max_gb * 1024 * 1024 * 1024)
+
+        # Preload noise first (smaller set, used every sample)
         for path in self.noise_files:
+            if cache_bytes >= max_bytes:
+                break
             if isinstance(path, str):
                 try:
                     waveform, _ = load_audio(path, self.sample_rate)
                     self._audio_cache[path] = waveform
+                    cache_bytes += waveform.nelement() * 4
+                except Exception:
+                    pass
+            loaded += 1
+
+        # Then preload clean files with remaining budget
+        for path in self.clean_files:
+            if cache_bytes >= max_bytes:
+                break
+            if isinstance(path, str):
+                try:
+                    waveform, _ = load_audio(path, self.sample_rate)
+                    self._audio_cache[path] = waveform
+                    cache_bytes += waveform.nelement() * 4
                 except Exception:
                     pass
             loaded += 1
             if loaded % 2000 == 0:
-                print(f"   Preloading... {loaded}/{total} ({loaded*100//total}%)")
+                print(f"   Preloading... {len(self._audio_cache)}/{total} "
+                      f"({cache_bytes / (1024**3):.1f}/{max_gb:.0f} GB)")
+
         elapsed = time.time() - t0
-        cache_mb = sum(v.nelement() * 4 for v in self._audio_cache.values()) / (1024**2)
-        print(f"   ✅ Preloaded {len(self._audio_cache)} files ({cache_mb:.0f} MB) in {elapsed:.1f}s")
+        cache_mb = cache_bytes / (1024**2)
+        print(f"   ✅ Cached {len(self._audio_cache)}/{total} files "
+              f"({cache_mb:.0f} MB, cap {max_gb:.0f} GB) in {elapsed:.1f}s")
+        remaining = total - len(self._audio_cache)
+        if remaining > 0:
+            print(f"   ℹ️  {remaining} files will be loaded on-the-fly (OS page cache)")
 
     # ------------------------------------------------------------------
     # Synthetic generators (unchanged from V1, kept for completeness)
