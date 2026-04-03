@@ -1,0 +1,21 @@
+# =============================================================================
+# AuraNet Dependencies
+# =============================================================================
+
+# Core
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# Configuration
+pyyaml>=6.0
+
+# Optional: ONNX export
+onnx>=1.14.0
+onnxruntime>=1.15.0
+
+# Optional: Audio quality metrics
+# pesq>=0.0.4
+# pystoi>=0.3.3
+
+# Development
+numpy>=1.21.0

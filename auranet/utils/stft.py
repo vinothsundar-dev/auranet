@@ -150,23 +150,20 @@ class CausalSTFT(nn.Module):
         window = self.window  # [n_fft]
         frames = frames * window.view(1, -1, 1)  # [B, n_fft, T]
 
-        # Vectorized overlap-add using F.fold (faster + cleaner gradient flow)
+        # Overlap-add reconstruction
         output_length = (n_frames - 1) * self.hop_length + self.n_fft
-        output = F.fold(
-            frames,                        # [B, n_fft, T]
-            output_size=(1, output_length),
-            kernel_size=(1, self.n_fft),
-            stride=(1, self.hop_length),
-        ).squeeze(1).squeeze(1)            # [B, output_length]
+        output = torch.zeros(batch_size, output_length, device=frames.device, dtype=frames.dtype)
+        window_sum = torch.zeros(output_length, device=frames.device, dtype=frames.dtype)
+        w_sq = window ** 2
 
-        # Window normalization: compute sum of squared windows per sample
-        w_sq = (window ** 2).unsqueeze(0).unsqueeze(-1).expand(1, -1, n_frames)  # [1, n_fft, T]
-        window_sum = F.fold(
-            w_sq,
-            output_size=(1, output_length),
-            kernel_size=(1, self.n_fft),
-            stride=(1, self.hop_length),
-        ).squeeze(0).squeeze(0).squeeze(0)  # [output_length]
+        for t in range(n_frames):
+            start = t * self.hop_length
+            end = start + self.n_fft
+            output[:, start:end] += frames[:, :, t]
+            window_sum[start:end] += w_sq
+
+        # Normalize — clamp avoids division by zero at edges where hann ≈ 0.
+        # Edge positions correspond to zero-padding, not actual signal.
         window_sum = window_sum.clamp(min=1e-11)
         output = output / window_sum.unsqueeze(0)
 

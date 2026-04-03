@@ -1,0 +1,53 @@
+{
+    // Python Configuration
+    "python.defaultInterpreterPath": "${workspaceFolder}/venv/bin/python",
+    "python.formatting.provider": "none",
+    "[python]": {
+        "editor.defaultFormatter": "ms-python.black-formatter",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.organizeImports": "explicit"
+        }
+    },
+    
+    // Jupyter Configuration
+    "jupyter.askForKernelRestart": false,
+    "notebook.cellToolbarLocation": {
+        "default": "right",
+        "jupyter-notebook": "left"
+    },
+    "notebook.output.scrolling": true,
+    "notebook.formatOnSave.enabled": true,
+    
+    // Editor Settings
+    "editor.rulers": [88, 100],
+    "editor.tabSize": 4,
+    "editor.insertSpaces": true,
+    "editor.trimAutoWhitespace": true,
+    "files.trimTrailingWhitespace": true,
+    "files.insertFinalNewline": true,
+    
+    // File Exclusions
+    "files.exclude": {
+        "**/__pycache__": true,
+        "**/*.pyc": true,
+        "**/venv": true,
+        "**/.ipynb_checkpoints": true
+    },
+    
+    // Search Exclusions
+    "search.exclude": {
+        "**/venv": true,
+        "**/checkpoints": true,
+        "**/datasets": true,
+        "**/*.pt": true,
+        "**/*.wav": true,
+        "**/*.mp3": true
+    },
+    
+    // Terminal
+    "terminal.integrated.cwd": "${workspaceFolder}",
+    
+    // Git
+    "git.ignoreLimitWarning": true
+}

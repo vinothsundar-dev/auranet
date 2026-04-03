@@ -269,19 +269,14 @@ class Decoder(nn.Module):
 
 class LearnableSigmoid(nn.Module):
     """
-    Learnable sigmoid: sigmoid(a * x + b) * 2 - 1
-    Range: (-1, +1). Allows magnitude scaling + phase manipulation.
-
-    INIT STRATEGY: bias=2.2 so sigmoid(2.2)*2-1 ≈ 0.8 at startup.
-    This starts near pass-through — the model learns to suppress noise
-    rather than starting from silence (which causes soft/muffled output).
+    Learnable sigmoid: sigmoid(a * x + b) * scale
+    Allows the network to control mask dynamic range.
     """
 
-    def __init__(self, in_features, beta=1.0, init_bias=2.2):
+    def __init__(self, in_features, beta=1.0):
         super().__init__()
         self.beta = nn.Parameter(torch.full((in_features,), beta))
-        # Initialize bias for near-passthrough: sigmoid(2.2)*2-1 ≈ 0.8
-        self.bias = nn.Parameter(torch.full((in_features,), init_bias))
+        self.bias = nn.Parameter(torch.zeros(in_features))
 
     def forward(self, x):
         # x: [B, 2, T, F] — apply per-frequency
@@ -375,12 +370,8 @@ class AuraNetV3(nn.Module):
         # Apply learnable sigmoid activation
         mask = self.mask_act(raw_mask)
 
-        # Apply mask with residual pass-through:
-        # enhanced = noisy * mask + floor * noisy
-        # This guarantees at least 'floor' fraction of original signal
-        # passes through, preventing complete speech suppression.
-        mask_floor = 0.05
-        enhanced_stft = noisy_stft * (mask + mask_floor)
+        # Apply mask to noisy input (complex multiplication)
+        enhanced_stft = noisy_stft * mask
 
         return enhanced_stft, hidden_out, gru_features
 

@@ -285,57 +285,6 @@ class DualModeEnhancer(nn.Module):
         return enhanced_audio.squeeze().to(input_device)
 
 
-def soft_knee_compressor(
-    audio: torch.Tensor,
-    threshold_db: float = -20.0,
-    ratio: float = 3.0,
-    knee_db: float = 6.0,
-    makeup_gain_db: float = 0.0,
-) -> torch.Tensor:
-    """
-    Lightweight soft-knee dynamic range compressor for waveform audio.
-
-    Args:
-        audio: Waveform tensor [..., N] (any shape, operates on last dim)
-        threshold_db: Compression threshold in dB (default -20)
-        ratio: Compression ratio above threshold (e.g. 3.0 = 3:1)
-        knee_db: Soft knee width in dB (0 = hard knee)
-        makeup_gain_db: Output gain compensation in dB
-
-    Returns:
-        Compressed audio, same shape as input
-    """
-    eps = 1e-8
-    # Frame-level RMS envelope (small window for responsiveness)
-    abs_audio = audio.abs() + eps
-    # Use per-sample level (simple, no lookahead needed for offline)
-    level_db = 20.0 * torch.log10(abs_audio)
-
-    half_knee = knee_db / 2.0
-    low_edge = threshold_db - half_knee
-    high_edge = threshold_db + half_knee
-
-    # Gain reduction in dB
-    gain_db = torch.zeros_like(level_db)
-
-    # Below knee: no compression
-    # In knee: quadratic transition
-    in_knee = (level_db > low_edge) & (level_db < high_edge)
-    if in_knee.any():
-        x = level_db[in_knee] - low_edge
-        gain_db[in_knee] = -(1.0 - 1.0 / ratio) * x * x / (2.0 * knee_db + eps)
-
-    # Above knee: linear compression
-    above = level_db >= high_edge
-    if above.any():
-        overshoot = level_db[above] - threshold_db
-        gain_db[above] = -overshoot * (1.0 - 1.0 / ratio)
-
-    # Apply gain + makeup
-    gain_linear = torch.pow(10.0, (gain_db + makeup_gain_db) / 20.0)
-    return audio * gain_linear
-
-
 def create_dual_mode_enhancer(model, stft):
     """Factory function to create dual-mode enhancer."""
     return DualModeEnhancer(model, stft)
