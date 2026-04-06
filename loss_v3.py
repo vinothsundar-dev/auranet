@@ -298,40 +298,73 @@ def loudness_normalize(enhanced, clean, min_scale=0.5, max_scale=2.0, eps=1e-8):
     return enhanced * scale
 
 
+class TemporalConsistencyLoss(nn.Module):
+    """
+    Penalizes abrupt frame-to-frame changes in the enhanced STFT.
+
+    Computed as L1 of the first-order temporal difference between
+    enhanced and clean STFT magnitude. Reduces musical noise / flutter
+    artifacts without requiring architecture changes.
+    """
+
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, pred_stft, target_stft):
+        """
+        Args:
+            pred_stft: [B, 2, T, F]
+            target_stft: [B, 2, T, F]
+        """
+        pred_mag = torch.sqrt(pred_stft[:, 0] ** 2 + pred_stft[:, 1] ** 2 + self.eps)
+        tgt_mag = torch.sqrt(target_stft[:, 0] ** 2 + target_stft[:, 1] ** 2 + self.eps)
+
+        # Temporal difference: how magnitude changes between adjacent frames
+        pred_diff = pred_mag[:, 1:, :] - pred_mag[:, :-1, :]
+        tgt_diff = tgt_mag[:, 1:, :] - tgt_mag[:, :-1, :]
+
+        return F.l1_loss(pred_diff, tgt_diff)
+
+
 class AuraNetV3Loss(nn.Module):
     """
     Combined loss for AuraNet V3 — Perceptual quality focused.
 
     Total = w1*SI-SNR + w2*CompressedMSE + w3*MultiResSTFT
-          + w4*EnergyPreservation + w5*LogMel
+          + w4*EnergyPreservation + w5*LogMel + w6*TemporalConsistency
 
-    Weight rationale:
+    Weight rationale (v3.1 rebalance):
     - SI-SNR (1.0): Primary perceptual driver — correlates with MOS
-    - Compressed MSE (0.3): Freq detail for consonants (reduced from 0.5)
-    - Multi-res STFT (0.2): Spectral shape (reduced from 0.3)
+    - Multi-res STFT (0.8): Increased — better spectral shape, less metallic
+    - Compressed MSE (0.5): Increased — freq detail for consonants
+    - Log-mel (0.3): Increased — perceptual frequency weighting
     - Energy preservation (0.1): Prevents over-suppression / softness
-    - Log-mel (0.15): Perceptual frequency weighting
+    - Temporal consistency (0.1): Reduces musical noise / flutter
     """
 
     def __init__(self,
                  weight_sisnr=1.0,
-                 weight_compressed_mse=0.3,
-                 weight_stft=0.2,
+                 weight_compressed_mse=0.5,
+                 weight_stft=0.8,
                  compress_factor=0.3,
                  weight_energy=0.1,
-                 weight_logmel=0.15):
+                 weight_logmel=0.3,
+                 weight_temporal=0.1):
         super().__init__()
         self.w_sisnr = weight_sisnr
         self.w_cmse = weight_compressed_mse
         self.w_stft = weight_stft
         self.w_energy = weight_energy
         self.w_logmel = weight_logmel
+        self.w_temporal = weight_temporal
 
         self.sisnr_loss = SISNRLoss()
         self.cmse_loss = CompressedMSELoss(compress_factor)
         self.stft_loss = MultiResSTFTLoss()
         self.energy_loss = EnergyPreservationLoss()
         self.logmel_loss = LogMelLoss()
+        self.temporal_loss = TemporalConsistencyLoss()
 
     def forward(self, pred_stft, target_stft,
                 pred_audio=None, target_audio=None):
@@ -377,6 +410,11 @@ class AuraNetV3Loss(nn.Module):
             loss_dict["multi_res_stft"] = torch.tensor(0.0, device=pred_stft.device)
             loss_dict["energy"] = torch.tensor(0.0, device=pred_stft.device)
             loss_dict["logmel"] = torch.tensor(0.0, device=pred_stft.device)
+
+        # Temporal consistency — reduces musical noise / frame jitter
+        l_temporal = self.temporal_loss(pred_stft, target_stft)
+        loss_dict["temporal"] = l_temporal
+        total = total + self.w_temporal * l_temporal
 
         loss_dict["total"] = total
         return total, loss_dict

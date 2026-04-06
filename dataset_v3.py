@@ -36,7 +36,7 @@ from utils.audio_utils import (
 # Production Augmentations: RIR, Codec simulation, Bandwidth limitation
 # =============================================================================
 
-def generate_synthetic_rir(length: int = 4000, sample_rate: int = 16000,
+def generate_synthetic_rir(length: int = 1600, sample_rate: int = 16000,
                            rt60: float = 0.0,
                            room_size: str = '') -> torch.Tensor:
     """
@@ -371,6 +371,7 @@ class AuraNetV3Dataset(Dataset):
 
         # In-memory audio cache: path → tensor (eliminates disk I/O after first load)
         self._audio_cache = {}
+        self._cache_bytes = 0  # Running total — avoids O(n) recomputation per access
 
         # Load real RIR files if directory provided
         self.rir_files = []
@@ -383,6 +384,24 @@ class AuraNetV3Dataset(Dataset):
                     )
                 if self.rir_files:
                     print(f"   RIR augmentation: {len(self.rir_files)} real RIRs loaded")
+
+        # Pre-compute RIR bank: avoids per-sample generation + shorter filters = faster conv
+        self._rir_bank = []
+        if self.rir_files:
+            for rp in self.rir_files[:200]:
+                try:
+                    ra, _ = load_audio(rp, sample_rate)
+                    if ra.dim() == 1: ra = ra.unsqueeze(0)
+                    self._rir_bank.append(ra[..., :4000])
+                except Exception:
+                    pass
+        if len(self._rir_bank) < 200:
+            n_synth = 200 - len(self._rir_bank)
+            self._rir_bank.extend(
+                [generate_synthetic_rir(length=1600, sample_rate=sample_rate)
+                 for _ in range(n_synth)]
+            )
+        print(f"   RIR bank: {len(self._rir_bank)} impulse responses pre-computed")
 
         if synthetic_mode:
             self.clean_files = list(range(num_synthetic_samples))
@@ -407,15 +426,16 @@ class AuraNetV3Dataset(Dataset):
         return sorted(files)
 
     def _load_cached(self, path: str) -> torch.Tensor:
-        """Load audio with LRU-style cache, capped at max_cache_mb."""
-        if path in self._audio_cache:
-            return self._audio_cache[path].clone()
+        """Load audio with cache. O(1) lookup via running byte counter."""
+        cached = self._audio_cache.get(path)
+        if cached is not None:
+            return cached.clone()
         waveform, _ = load_audio(path, self.sample_rate)
-        # Only cache if under memory limit (default 4 GB)
-        cache_bytes = sum(v.nelement() * 4 for v in self._audio_cache.values())
+        # Only cache if under memory limit (tracked as running total)
         max_bytes = getattr(self, '_max_cache_mb', 4096) * 1024 * 1024
-        if cache_bytes < max_bytes:
+        if self._cache_bytes < max_bytes:
             self._audio_cache[path] = waveform
+            self._cache_bytes += waveform.nelement() * 4
         return waveform.clone()
 
     def preload_audio(self, max_gb: float = 4.0):
@@ -461,6 +481,7 @@ class AuraNetV3Dataset(Dataset):
         cache_mb = cache_bytes / (1024**2)
         print(f"   ✅ Cached {len(self._audio_cache)}/{total} files "
               f"({cache_mb:.0f} MB, cap {max_gb:.0f} GB) in {elapsed:.1f}s")
+        self._cache_bytes = cache_bytes  # Sync running counter
         remaining = total - len(self._audio_cache)
         if remaining > 0:
             print(f"   ℹ️  {remaining} files will be loaded on-the-fly (OS page cache)")
@@ -566,20 +587,10 @@ class AuraNetV3Dataset(Dataset):
             # 2. Speed perturbation
             clean_audio = self._random_speed(clean_audio)
 
-            # 3. RIR augmentation — apply reverb to clean speech
-            if random.random() < self.rir_prob:
-                if self.rir_files:
-                    rir_path = random.choice(self.rir_files)
-                    try:
-                        rir_audio, _ = load_audio(rir_path, self.sample_rate)
-                        if rir_audio.dim() == 1:
-                            rir_audio = rir_audio.unsqueeze(0)
-                        rir_audio = rir_audio[..., :8000]  # max 500ms
-                        clean_audio = apply_rir(clean_audio, rir_audio, self.sample_rate)
-                    except Exception:
-                        clean_audio = apply_rir(clean_audio, None, self.sample_rate)
-                else:
-                    clean_audio = apply_rir(clean_audio, None, self.sample_rate)
+            # 3. RIR augmentation — use pre-computed bank (no per-sample I/O or generation)
+            if random.random() < self.rir_prob and self._rir_bank:
+                rir = random.choice(self._rir_bank)
+                clean_audio = apply_rir(clean_audio, rir, self.sample_rate)
 
             # 4. Codec degradation chain (lowpass + resample + quantization)
             if random.random() < self.codec_prob:

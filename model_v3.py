@@ -269,23 +269,24 @@ class Decoder(nn.Module):
 
 class LearnableSigmoid(nn.Module):
     """
-    Learnable sigmoid: sigmoid(a * x + b) * 2 - 1
-    Range: (-1, +1). Allows magnitude scaling + phase manipulation.
+    Learnable sigmoid: mask_floor + (1 - mask_floor) * sigmoid(a * x + b)
+    Range: [mask_floor, 1.0]. Prevents phase inversion and over-suppression.
 
-    INIT STRATEGY: bias=2.2 so sigmoid(2.2)*2-1 ≈ 0.8 at startup.
+    INIT STRATEGY: bias=2.0 so sigmoid(2.0) ≈ 0.88, giving initial mask ≈ 0.88.
     This starts near pass-through — the model learns to suppress noise
     rather than starting from silence (which causes soft/muffled output).
     """
 
-    def __init__(self, in_features, beta=1.0, init_bias=2.2):
+    def __init__(self, in_features, beta=1.0, init_bias=2.0, mask_floor=0.05):
         super().__init__()
         self.beta = nn.Parameter(torch.full((in_features,), beta))
-        # Initialize bias for near-passthrough: sigmoid(2.2)*2-1 ≈ 0.8
         self.bias = nn.Parameter(torch.full((in_features,), init_bias))
+        self.mask_floor = mask_floor
 
     def forward(self, x):
         # x: [B, 2, T, F] — apply per-frequency
-        return torch.sigmoid(self.beta * x + self.bias) * 2.0 - 1.0  # range (-1, 1)
+        # Output range: [mask_floor, 1.0] — no phase inversion possible
+        return self.mask_floor + (1.0 - self.mask_floor) * torch.sigmoid(self.beta * x + self.bias)
 
 
 # =============================================================================
@@ -373,14 +374,11 @@ class AuraNetV3(nn.Module):
             )
 
         # Apply learnable sigmoid activation
+        # Mask range is [0.05, 1.0] — floor is built into LearnableSigmoid
         mask = self.mask_act(raw_mask)
 
-        # Apply mask with residual pass-through:
-        # enhanced = noisy * mask + floor * noisy
-        # This guarantees at least 'floor' fraction of original signal
-        # passes through, preventing complete speech suppression.
-        mask_floor = 0.05
-        enhanced_stft = noisy_stft * (mask + mask_floor)
+        # Apply mask directly (floor already embedded in activation)
+        enhanced_stft = noisy_stft * mask
 
         return enhanced_stft, hidden_out, gru_features
 
