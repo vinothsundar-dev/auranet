@@ -653,3 +653,58 @@ def create_v3_dataloader(clean_dir, noise_dir, batch_size=16, num_workers=2,
         ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True, drop_last=True,
     )
+
+
+# =============================================================================
+# CachedAuraNetDataset — ultra-fast loader for pre-generated .pt pairs
+# =============================================================================
+
+class CachedAuraNetDataset(Dataset):
+    """
+    Zero-overhead dataset backed by pre-generated .pt pair files.
+
+    Replaces AuraNetV3Dataset during training once pairs are precomputed
+    offline by scripts/precompute_dataset.py.
+
+    __getitem__ is a single torch.load() call — no FLAC decoding, no
+    augmentation, no Python-side mixing. Combined with:
+        - pin_memory=True      → DMA transfer to GPU, no extra copy
+        - num_workers=8        → 8 independent torch.load() threads
+        - prefetch_factor=4    → 4 batches queued per worker
+    this essentially eliminates the CPU bottleneck entirely.
+
+    File format (each pair_XXXXXX.pt):
+        {
+            "noisy_audio": FloatTensor[N],
+            "clean_audio": FloatTensor[N],
+        }
+
+    Generate with:
+        python scripts/precompute_dataset.py \\
+            --clean_dir ... --noise_dir ... \\
+            --output_dir /kaggle/working/auranet_pt_cache \\
+            --n_pairs 20000 --workers 4
+    """
+
+    def __init__(self, cache_dir: Union[str, Path]):
+        cache_dir = Path(cache_dir)
+        self.files = sorted(cache_dir.glob("pair_*.pt"))
+        if len(self.files) == 0:
+            raise FileNotFoundError(
+                f"No pair_*.pt files found in {cache_dir}.\n"
+                f"Run: python scripts/precompute_dataset.py "
+                f"--clean_dir ... --noise_dir ... --output_dir {cache_dir} --n_pairs 20000"
+            )
+        print(f"   CachedDataset: {len(self.files):,} pre-computed pairs  ({cache_dir})")
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        path = self.files[idx]
+        try:
+            # weights_only=True: safe unpickling (PyTorch >= 2.0)
+            return torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            # PyTorch < 2.0: weights_only not supported
+            return torch.load(path, map_location="cpu")
