@@ -125,12 +125,12 @@ class TrainerV3:
 
         # Training config
         self.num_epochs = train_cfg.get("num_epochs", 100)
-        self.grad_clip = train_cfg.get("gradient_clip", 5.0)
+        self.grad_clip = train_cfg.get("gradient_clip", 3.0)
         self.warmup_epochs = train_cfg.get("warmup_epochs", 5)
         self.patience = train_cfg.get("early_stop_patience", 15)
 
-        # AMP (CUDA only)
-        self.use_amp = train_cfg.get("use_amp", True) and self.device.type == "cuda"
+        # AMP (CUDA only) — disabled by default for stability
+        self.use_amp = train_cfg.get("use_amp", False) and self.device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
 
         # EMA
@@ -169,8 +169,18 @@ class TrainerV3:
                 with torch.amp.autocast("cuda"):
                     enhanced_stft, _, _ = self.model(noisy_stft)
                     enhanced_audio = self.stft.inverse(enhanced_stft)
+                    # Numerical safety: clamp output
+                    enhanced_audio = torch.nan_to_num(enhanced_audio, nan=0.0, posinf=1.0, neginf=-1.0)
+                    enhanced_audio = torch.clamp(enhanced_audio, -1.0, 1.0)
+                    enhanced_audio = enhanced_audio + 1e-6
                     loss, ld = self.criterion(enhanced_stft, clean_stft,
                                               enhanced_audio, clean_audio)
+
+                # NaN/Inf guard
+                if not torch.isfinite(loss):
+                    print(f"  [WARN] Skipping batch {batch_idx} — non-finite loss")
+                    self.optimizer.zero_grad()
+                    continue
 
                 self.scaler.scale(loss).backward()
                 if self.grad_clip > 0:
@@ -181,8 +191,19 @@ class TrainerV3:
             else:
                 enhanced_stft, _, _ = self.model(noisy_stft)
                 enhanced_audio = self.stft.inverse(enhanced_stft)
+                # Numerical safety: clamp output
+                enhanced_audio = torch.nan_to_num(enhanced_audio, nan=0.0, posinf=1.0, neginf=-1.0)
+                enhanced_audio = torch.clamp(enhanced_audio, -1.0, 1.0)
+                enhanced_audio = enhanced_audio + 1e-6
                 loss, ld = self.criterion(enhanced_stft, clean_stft,
                                           enhanced_audio, clean_audio)
+
+                # NaN/Inf guard
+                if not torch.isfinite(loss):
+                    print(f"  [WARN] Skipping batch {batch_idx} — non-finite loss")
+                    self.optimizer.zero_grad()
+                    continue
+
                 loss.backward()
                 if self.grad_clip > 0:
                     nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
