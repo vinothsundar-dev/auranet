@@ -346,6 +346,29 @@ class AuraNetV3(nn.Module):
         # Learnable mask activation (per frequency bin)
         self.mask_act = LearnableSigmoid(freq_bins)
 
+        self._validate_structure(context="__init__")
+
+    def _required_modules(self):
+        return ("encoder", "bottleneck", "decoder", "mask_act")
+
+    def _validate_structure(self, context="forward"):
+        missing = [name for name in self._required_modules() if not hasattr(self, name)]
+        if missing:
+            raise AttributeError(
+                f"AuraNetV3 structure invalid during {context}: missing {missing}. "
+                f"Available attrs sample: {sorted(list(self.__dict__.keys()))[:20]}"
+            )
+
+    def debug_structure(self):
+        self._validate_structure(context="debug_structure")
+        return {
+            "class": self.__class__.__name__,
+            "encoder": self.encoder.__class__.__name__,
+            "bottleneck": self.bottleneck.__class__.__name__,
+            "decoder": self.decoder.__class__.__name__,
+            "mask_act": self.mask_act.__class__.__name__,
+        }
+
     def forward(self, noisy_stft, hidden=None):
         """
         Args:
@@ -357,6 +380,8 @@ class AuraNetV3(nn.Module):
             hidden_out: GRU hidden state for streaming
             gru_features: [B, T, H] (for auxiliary tasks if needed)
         """
+        self._validate_structure(context="forward")
+
         # Encode
         encoded, skips = self.encoder(noisy_stft)
 
@@ -396,4 +421,5 @@ def create_auranet_v3(config=None):
     n_params = model.count_parameters()
     size_mb = sum(p.numel() * p.element_size() for p in model.parameters()) / 1e6
     print(f"AuraNet V3: {n_params:,} parameters ({size_mb:.1f} MB)")
+    print(f"AuraNet V3 structure: {model.debug_structure()}")
     return model
