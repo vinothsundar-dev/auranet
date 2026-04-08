@@ -26,12 +26,32 @@ from pathlib import Path
 from typing import Dict, Optional
 from copy import deepcopy
 
+# =============================================================================
+# Performance Configuration - MUST be before torch imports
+# =============================================================================
+# Disable CUDA_LAUNCH_BLOCKING for performance (don't sync after every kernel)
+os.environ.setdefault('CUDA_LAUNCH_BLOCKING', '0')
+
 import yaml
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from tqdm import tqdm
+
+# Disable cuDNN benchmark to avoid warmup stalls
+# benchmark=True can cause long initial delays while cuDNN searches for optimal algorithms
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = False  # Allow non-deterministic for speed
+
+# Disable torch._dynamo completely to avoid hidden compilation overhead
+try:
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True
+    torch._dynamo.disable()
+except (ImportError, AttributeError):
+    pass  # Older PyTorch version without dynamo
 
 from model_v3 import AuraNetV3, create_auranet_v3
 from loss_v3 import AuraNetV3Loss
@@ -158,7 +178,16 @@ class TrainerV3:
         loss_sums = {}
         n = 0
 
-        for batch_idx, batch in enumerate(loader):
+        # Use tqdm with mininterval=0 to ensure updates from first batch
+        pbar = tqdm(
+            enumerate(loader),
+            total=len(loader),
+            desc=f"Epoch {self.current_epoch + 1}",
+            mininterval=0,  # Update immediately from first batch
+            leave=True
+        )
+
+        for batch_idx, batch in pbar:
             noisy_stft = batch["noisy_stft"].to(self.device)
             clean_stft = batch["clean_stft"].to(self.device)
             clean_audio = batch["clean_audio"].to(self.device)
@@ -215,8 +244,8 @@ class TrainerV3:
                 loss_sums[k] = loss_sums.get(k, 0.0) + v.item()
             n += 1
 
-            if batch_idx % 50 == 0:
-                print(f"  batch {batch_idx}/{len(loader)} | loss {loss.item():.4f}")
+            # Update tqdm progress bar with current loss
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
         avg = {k: v / n for k, v in loss_sums.items()}
         avg["total"] = total_loss / n
