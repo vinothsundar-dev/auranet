@@ -35,9 +35,11 @@ os.environ.setdefault('CUDA_LAUNCH_BLOCKING', '0')
 import yaml
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import numpy as np
 
@@ -54,7 +56,7 @@ except (ImportError, AttributeError):
     pass
 
 from model_v3 import AuraNetV3, create_auranet_v3
-from loss_perceptual import PerceptualLoss
+from loss_perceptual import PerceptualLoss, WarmStartLoss
 from dataset_v3 import AuraNetV3Dataset
 from utils.stft import CausalSTFT
 from metrics import compute_pesq, compute_stoi
@@ -146,10 +148,13 @@ class PerceptualFineTuner:
     """
 
     def __init__(self, config: Dict, checkpoint_path: str, device: str = 'auto',
-                 freeze_encoder: bool = False):
+                 freeze_encoder: bool = False, use_warmstart: bool = False,
+                 warmup_epochs: int = 3):
         self.config = config
         self.checkpoint_path = checkpoint_path
         self.freeze_encoder = freeze_encoder
+        self.use_warmstart = use_warmstart
+        self.warmup_epochs = warmup_epochs
 
         # Device
         if device == 'auto':
@@ -175,17 +180,33 @@ class PerceptualFineTuner:
             win_length=stft_cfg.get('window_size', 160),
         ).to(self.device)
 
-        # Perceptual loss
+        # Loss function
         train_cfg = config.get('training', {})
-        self.criterion = PerceptualLoss(
-            weight_loud=train_cfg.get('weight_loud', 0.50),
-            weight_stft=train_cfg.get('weight_stft', 0.25),
-            weight_mel=train_cfg.get('weight_mel', 0.15),
-            weight_sisnr=train_cfg.get('weight_sisnr', 0.10),
-            weight_harmonic=train_cfg.get('weight_harmonic', 0.05),
-            use_harmonic=train_cfg.get('use_harmonic', True),
-            sample_rate=config.get('audio', {}).get('sample_rate', 16000),
-        )
+        device_str = 'cuda' if self.device.type == 'cuda' else 'cpu'
+
+        if self.use_warmstart:
+            # Two-phase warm-start loss
+            self.criterion = WarmStartLoss(
+                warmup_epochs=self.warmup_epochs,
+                phase1_sisnr_weight=0.6,
+                phase1_stft_weight=0.4,
+                fft_sizes=[256, 512, 1024],
+                device=device_str
+            )
+            self.is_warmstart = True
+        else:
+            # Direct perceptual loss (corrected weights)
+            self.criterion = PerceptualLoss(
+                weight_loud=train_cfg.get('weight_loud', 0.45),
+                weight_stft=train_cfg.get('weight_stft', 0.30),
+                weight_mel=train_cfg.get('weight_mel', 0.15),
+                weight_sisnr=train_cfg.get('weight_sisnr', 0.10),
+                weight_harmonic=train_cfg.get('weight_harmonic', 0.0),
+                use_harmonic=train_cfg.get('use_harmonic', False),
+                sample_rate=config.get('audio', {}).get('sample_rate', 16000),
+                device=device_str
+            )
+            self.is_warmstart = False
 
         # Optimizer — lower LR for fine-tuning
         self.lr = train_cfg.get('learning_rate', 1e-4)
@@ -219,6 +240,12 @@ class PerceptualFineTuner:
 
         # EMA
         self.ema = EMA(self.model, decay=0.999)
+
+        # AMP (Automatic Mixed Precision) - only for CUDA
+        self.use_amp = (self.device.type == 'cuda')
+        self.scaler = GradScaler(enabled=self.use_amp)
+        if self.use_amp:
+            print("AMP enabled (GradScaler active)")
 
         # Checkpointing
         self.ckpt_dir = Path(train_cfg.get('checkpoint_dir', 'checkpoints'))
@@ -294,26 +321,33 @@ class PerceptualFineTuner:
 
             self.optimizer.zero_grad()
 
-            # Forward pass
-            noisy_stft = self.stft(noisy_audio)
-            clean_stft = self.stft(clean_audio)
+            # Forward pass with AMP autocast
+            with autocast(enabled=self.use_amp):
+                noisy_stft = self.stft(noisy_audio)
+                clean_stft = self.stft(clean_audio)
 
-            enhanced_stft, _, _ = self.model(noisy_stft)
+                enhanced_stft, _, _ = self.model(noisy_stft)
 
-            # Reconstruct audio with tanh (not clamp)
-            enhanced_audio = self.stft.inverse(enhanced_stft)
-            min_len = min(enhanced_audio.shape[-1], clean_audio.shape[-1])
-            enhanced_audio = enhanced_audio[..., :min_len]
-            clean_audio_batch = clean_audio.squeeze(1)[..., :min_len]
+                # Reconstruct audio with tanh (not clamp)
+                enhanced_audio = self.stft.inverse(enhanced_stft)
+                min_len = min(enhanced_audio.shape[-1], clean_audio.shape[-1])
+                enhanced_audio = enhanced_audio[..., :min_len]
+                clean_audio_batch = clean_audio.squeeze(1)[..., :min_len]
 
-            # Apply tanh for smooth saturation (replaces hard clamp)
-            enhanced_audio = torch.tanh(enhanced_audio)
+                # Apply tanh for smooth saturation (replaces hard clamp)
+                enhanced_audio = torch.tanh(enhanced_audio)
 
-            # Compute perceptual loss
-            loss, loss_dict = self.criterion(
-                enhanced_audio, clean_audio_batch,
-                enhanced_stft, clean_stft
-            )
+                # Compute loss (handle both WarmStartLoss and PerceptualLoss)
+                if self.is_warmstart:
+                    # WarmStartLoss returns just the loss value
+                    loss = self.criterion(enhanced_audio, clean_audio_batch)
+                    loss_dict = {'total': loss}
+                else:
+                    # PerceptualLoss returns (loss, loss_dict)
+                    loss, loss_dict = self.criterion(
+                        enhanced_audio, clean_audio_batch,
+                        enhanced_stft, clean_stft
+                    )
 
             # NaN guard
             if not torch.isfinite(loss):
@@ -321,20 +355,26 @@ class PerceptualFineTuner:
                 self.optimizer.zero_grad()
                 continue
 
-            # Backward
-            loss.backward()
+            # Backward with scaler
+            self.scaler.scale(loss).backward()
 
-            # Gradient clipping
+            # Gradient clipping (unscale first for correct norm)
             if self.grad_clip > 0:
+                self.scaler.unscale_(self.optimizer)
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
 
-            self.optimizer.step()
+            # Optimizer step with scaler
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             self.ema.update(self.model)
 
             # Accumulate losses
             total_loss += loss.item()
             for k, v in loss_dict.items():
-                loss_sums[k] = loss_sums.get(k, 0.0) + v.item()
+                if isinstance(v, torch.Tensor):
+                    loss_sums[k] = loss_sums.get(k, 0.0) + v.item()
+                else:
+                    loss_sums[k] = loss_sums.get(k, 0.0) + v
             n += 1
 
             # Update progress bar
@@ -383,15 +423,22 @@ class PerceptualFineTuner:
             # Apply tanh
             enhanced_audio = torch.tanh(enhanced_audio)
 
-            # Loss
-            loss, loss_dict = self.criterion(
-                enhanced_audio, clean_audio_batch,
-                enhanced_stft, clean_stft
-            )
+            # Loss (handle both WarmStartLoss and PerceptualLoss)
+            if self.is_warmstart:
+                loss = self.criterion(enhanced_audio, clean_audio_batch)
+                loss_dict = {'total': loss}
+            else:
+                loss, loss_dict = self.criterion(
+                    enhanced_audio, clean_audio_batch,
+                    enhanced_stft, clean_stft
+                )
 
             total_loss += loss.item()
             for k, v in loss_dict.items():
-                loss_sums[k] = loss_sums.get(k, 0.0) + v.item()
+                if isinstance(v, torch.Tensor):
+                    loss_sums[k] = loss_sums.get(k, 0.0) + v.item()
+                else:
+                    loss_sums[k] = loss_sums.get(k, 0.0) + v
             n += 1
 
             # Compute perceptual metrics for first few samples
@@ -492,6 +539,8 @@ class PerceptualFineTuner:
         print(f"  Learning Rate: {self.lr}")
         print(f"  Scheduler:     {self.scheduler_type}")
         print(f"  Freeze Encoder:{self.freeze_encoder}")
+        print(f"  Warm-Start:    {self.use_warmstart}" + (f" ({self.warmup_epochs} epochs)" if self.use_warmstart else ""))
+        print(f"  AMP:           {self.use_amp}")
         print(f"  Device:        {self.device}")
         print(f"  Batches/epoch: {len(train_loader)}")
         if val_loader:
@@ -501,6 +550,10 @@ class PerceptualFineTuner:
         for epoch in range(self.current_epoch, self.num_epochs):
             self.current_epoch = epoch
             t0 = time.time()
+
+            # Update warm-start loss epoch (1-indexed)
+            if self.is_warmstart:
+                self.criterion.set_epoch(epoch + 1)
 
             # Train
             train_losses = self.train_epoch(train_loader)
@@ -572,6 +625,10 @@ def main():
                         help="Batch size")
     parser.add_argument("--freeze-encoder", action="store_true",
                         help="Freeze encoder layers")
+    parser.add_argument("--warmstart", action="store_true",
+                        help="Use warm-start loss (Phase 1: SI-SNR+STFT, Phase 2: Perceptual)")
+    parser.add_argument("--warmup-epochs", type=int, default=3,
+                        help="Number of warmup epochs for warm-start training")
     parser.add_argument("--device", type=str, default="auto",
                         help="Device (auto, cuda, cpu, mps)")
     parser.add_argument("--synthetic", action="store_true",
@@ -637,7 +694,9 @@ def main():
         config=config,
         checkpoint_path=args.checkpoint,
         device=args.device,
-        freeze_encoder=args.freeze_encoder
+        freeze_encoder=args.freeze_encoder,
+        use_warmstart=args.warmstart,
+        warmup_epochs=args.warmup_epochs
     )
 
     # Train

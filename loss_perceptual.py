@@ -5,18 +5,19 @@
 # OBJECTIVE: Transform AuraNet from "high SI-SNR" → "perceptually natural"
 #
 # Target Metrics:
-#   PESQ: 2.8–3.1 (from ~2.5)
-#   STOI: 0.86–0.90 (from ~0.83)
-#   SI-SNR: maintain ≥16 dB
+#   PESQ: ≥2.8 (from ~2.3-2.5)
+#   STOI: ≥0.86 (from ~0.81)
+#   SI-SNR: maintain ≥15 dB
 #
-# LOSS FORMULA:
-#   L_total = 0.50 * LoudLoss (frequency-weighted log-power)
-#           + 0.25 * MultiResolutionSTFTLoss ([256, 512, 1024])
-#           + 0.15 * MelSpectrogramLoss (80 mels, torchaudio-style)
+# CORRECTED LOSS FORMULA:
+#   L_total = 0.45 * LoudLoss (frequency-weighted log-power)
+#           + 0.30 * MultiResolutionSTFTLoss ([256, 512, 1024])
+#           + 0.15 * MelSpectrogramLoss (80 mels)
 #           + 0.10 * SI_SNR_Loss (stabilizer)
 #
-# OPTIONAL:
-#   + 0.05 * HarmonicPreservationLoss (spectral peak/contrast)
+# WARM-START STRATEGY:
+#   Phase 1 (epochs 1-3): 0.6*SI-SNR + 0.4*STFT (stability)
+#   Phase 2 (epochs 4+):  Full perceptual loss (quality)
 #
 # =============================================================================
 
@@ -509,21 +510,21 @@ class PerceptualLoss(nn.Module):
             + w_stft * MultiResolutionSTFTLoss
             + w_mel * MelSpectrogramLoss
             + w_sisnr * SISNRLoss
-            + w_harmonic * HarmonicPreservationLoss (optional)
 
-    Default weights optimized for:
-    - PESQ: 2.8–3.1
-    - STOI: 0.86–0.90
-    - SI-SNR: ≥16 dB
+    CORRECTED WEIGHTS (for PESQ ≥2.8, STOI ≥0.86):
+    - LoudLoss: 0.45 (primary perceptual driver)
+    - MultiResSTFT: 0.30 (spectral detail)
+    - Mel: 0.15 (perceptual bands)
+    - SI-SNR: 0.10 (stabilizer only)
     """
 
     def __init__(self,
-                 weight_loud=0.50,
-                 weight_stft=0.25,
+                 weight_loud=0.45,
+                 weight_stft=0.30,
                  weight_mel=0.15,
                  weight_sisnr=0.10,
-                 weight_harmonic=0.05,
-                 use_harmonic=True,
+                 weight_harmonic=0.0,
+                 use_harmonic=False,
                  sample_rate=16000):
         super().__init__()
 
@@ -557,7 +558,7 @@ class PerceptualLoss(nn.Module):
                 n_fft=1024, hop_length=256, n_bands=6
             )
 
-        print(f"PerceptualLoss initialized:")
+        print(f"PerceptualLoss initialized (CORRECTED WEIGHTS):")
         print(f"  LoudLoss (1-4kHz boost):     {weight_loud:.2f}")
         print(f"  MultiResSTFT [256,512,1024]: {weight_stft:.2f}")
         print(f"  MelSpectrogram (80 mels):    {weight_mel:.2f}")
@@ -662,3 +663,148 @@ Replace: output.clamp(-1, 1)
 With:    output = torch.tanh(output)
 Reason:  tanh is smooth and differentiable; clamp has zero gradients at edges
 """
+
+
+# ==============================================================================
+# WARM-START LOSS (Two-Phase Training Strategy)
+# ==============================================================================
+
+class WarmStartLoss(nn.Module):
+    """
+    Two-phase warm-start training loss.
+
+    Phase 1 (epochs 1-3): Stability-focused
+        L_total = 0.6 * SI_SNR + 0.4 * STFT_loss
+        -> Establishes basic denoising before perceptual refinement
+
+    Phase 2 (epochs 4+): Quality-focused
+        L_total = Full PerceptualLoss (0.45*Loud + 0.30*STFT + 0.15*Mel + 0.10*SI-SNR)
+        -> Fine-tunes for perceptual quality (PESQ/STOI)
+
+    Usage:
+        loss_fn = WarmStartLoss(warmup_epochs=3)
+        for epoch in range(num_epochs):
+            loss_fn.set_epoch(epoch + 1)  # 1-indexed
+            for batch in dataloader:
+                loss = loss_fn(pred, target)
+    """
+
+    def __init__(
+        self,
+        warmup_epochs: int = 3,
+        phase1_sisnr_weight: float = 0.6,
+        phase1_stft_weight: float = 0.4,
+        fft_sizes: list = [256, 512, 1024],
+        device: str = 'cuda'
+    ):
+        super().__init__()
+        self.warmup_epochs = warmup_epochs
+        self.phase1_sisnr_weight = phase1_sisnr_weight
+        self.phase1_stft_weight = phase1_stft_weight
+        self.current_epoch = 1
+
+        # Phase 1 losses (stability)
+        self.sisnr_loss = SISNRLoss()
+        self.stft_loss = MultiResolutionSTFTLoss(fft_sizes=fft_sizes, device=device)
+
+        # Phase 2 loss (perceptual quality)
+        self.perceptual_loss = PerceptualLoss(
+            fft_sizes=fft_sizes,
+            use_harmonic=False,  # Disabled by default for stability
+            device=device
+        )
+
+        print(f"[WarmStartLoss] Initialized:")
+        print(f"  Phase 1 (epochs 1-{warmup_epochs}): {phase1_sisnr_weight}*SI-SNR + {phase1_stft_weight}*STFT")
+        print(f"  Phase 2 (epochs {warmup_epochs+1}+): Full PerceptualLoss")
+
+    def set_epoch(self, epoch: int):
+        """Update current epoch (1-indexed)."""
+        old_phase = 1 if self.current_epoch <= self.warmup_epochs else 2
+        self.current_epoch = epoch
+        new_phase = 1 if epoch <= self.warmup_epochs else 2
+
+        if old_phase != new_phase:
+            print(f"[WarmStartLoss] Switching from Phase {old_phase} to Phase {new_phase} at epoch {epoch}")
+
+    def get_phase(self) -> int:
+        """Return current training phase (1 or 2)."""
+        return 1 if self.current_epoch <= self.warmup_epochs else 2
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute loss based on current training phase.
+
+        Args:
+            pred: Predicted signal [B, T] or [B, 1, T]
+            target: Target signal [B, T] or [B, 1, T]
+
+        Returns:
+            Total loss scalar
+        """
+        # Squeeze channel dimension if present
+        if pred.dim() == 3:
+            pred = pred.squeeze(1)
+        if target.dim() == 3:
+            target = target.squeeze(1)
+
+        phase = self.get_phase()
+
+        if phase == 1:
+            # Phase 1: Stability-focused (SI-SNR + STFT)
+            sisnr = self.sisnr_loss(pred, target)
+            stft = self.stft_loss(pred, target)
+            total = self.phase1_sisnr_weight * sisnr + self.phase1_stft_weight * stft
+            return total
+        else:
+            # Phase 2: Quality-focused (full perceptual loss)
+            return self.perceptual_loss(pred, target)
+
+    def forward_with_breakdown(self, pred: torch.Tensor, target: torch.Tensor) -> dict:
+        """
+        Compute loss with detailed breakdown for logging.
+
+        Returns:
+            Dictionary with 'total', 'phase', and individual loss components
+        """
+        if pred.dim() == 3:
+            pred = pred.squeeze(1)
+        if target.dim() == 3:
+            target = target.squeeze(1)
+
+        phase = self.get_phase()
+
+        if phase == 1:
+            sisnr = self.sisnr_loss(pred, target)
+            stft = self.stft_loss(pred, target)
+            total = self.phase1_sisnr_weight * sisnr + self.phase1_stft_weight * stft
+            return {
+                'total': total,
+                'phase': 1,
+                'sisnr': sisnr.item(),
+                'stft': stft.item(),
+            }
+        else:
+            breakdown = self.perceptual_loss.forward_with_breakdown(pred, target)
+            breakdown['phase'] = 2
+            return breakdown
+
+
+def create_warmstart_loss(warmup_epochs: int = 3, device: str = 'cuda') -> WarmStartLoss:
+    """
+    Factory function to create WarmStartLoss with recommended settings.
+
+    Args:
+        warmup_epochs: Number of epochs for Phase 1 (default: 3)
+        device: 'cuda' or 'cpu'
+
+    Returns:
+        WarmStartLoss instance
+    """
+    return WarmStartLoss(
+        warmup_epochs=warmup_epochs,
+        phase1_sisnr_weight=0.6,
+        phase1_stft_weight=0.4,
+        fft_sizes=[256, 512, 1024],
+        device=device
+    )
