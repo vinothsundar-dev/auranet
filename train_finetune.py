@@ -182,7 +182,7 @@ class PerceptualFineTuner:
 
         # Loss function
         train_cfg = config.get('training', {})
-        device_str = 'cuda' if self.device.type == 'cuda' else 'cpu'
+        sample_rate = config.get('audio', {}).get('sample_rate', 16000)
 
         if self.use_warmstart:
             # Two-phase warm-start loss
@@ -191,7 +191,7 @@ class PerceptualFineTuner:
                 phase1_sisnr_weight=0.6,
                 phase1_stft_weight=0.4,
                 fft_sizes=[256, 512, 1024],
-                device=device_str
+                sample_rate=sample_rate
             )
             self.is_warmstart = True
         else:
@@ -203,8 +203,7 @@ class PerceptualFineTuner:
                 weight_sisnr=train_cfg.get('weight_sisnr', 0.10),
                 weight_harmonic=train_cfg.get('weight_harmonic', 0.0),
                 use_harmonic=train_cfg.get('use_harmonic', False),
-                sample_rate=config.get('audio', {}).get('sample_rate', 16000),
-                device=device_str
+                sample_rate=sample_rate
             )
             self.is_warmstart = False
 
@@ -217,9 +216,9 @@ class PerceptualFineTuner:
             betas=(0.9, 0.999),
         )
 
-        # Scheduler
+        # Scheduler (default: ReduceLROnPlateau as recommended)
         self.num_epochs = train_cfg.get('num_epochs', 10)
-        scheduler_type = train_cfg.get('scheduler', 'cosine')
+        scheduler_type = train_cfg.get('scheduler', 'plateau')  # Changed default to plateau
 
         if scheduler_type == 'cosine':
             self.scheduler = CosineAnnealingLR(
@@ -227,7 +226,7 @@ class PerceptualFineTuner:
                 T_max=self.num_epochs,
                 eta_min=1e-6,
             )
-        else:  # plateau
+        else:  # plateau (default)
             self.scheduler = ReduceLROnPlateau(
                 self.optimizer, mode='min', factor=0.5,
                 patience=2, min_lr=1e-6,

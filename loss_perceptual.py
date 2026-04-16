@@ -613,6 +613,22 @@ class PerceptualLoss(nn.Module):
         loss_dict['total'] = total
         return total, loss_dict
 
+    def forward_with_breakdown(self, pred_audio: torch.Tensor,
+                               target_audio: torch.Tensor) -> Dict:
+        """
+        Compute loss and return breakdown dictionary (for WarmStartLoss compatibility).
+
+        Returns:
+            Dictionary with 'total' and individual loss components
+        """
+        total, loss_dict = self.forward(pred_audio, target_audio)
+        # Convert tensors to floats for the breakdown
+        breakdown = {'total': total}
+        for k, v in loss_dict.items():
+            if k != 'total':
+                breakdown[k] = v.item() if isinstance(v, torch.Tensor) else v
+        return breakdown
+
 
 # =============================================================================
 # Loss Explanation Summary
@@ -695,7 +711,7 @@ class WarmStartLoss(nn.Module):
         phase1_sisnr_weight: float = 0.6,
         phase1_stft_weight: float = 0.4,
         fft_sizes: list = [256, 512, 1024],
-        device: str = 'cuda'
+        sample_rate: int = 16000
     ):
         super().__init__()
         self.warmup_epochs = warmup_epochs
@@ -705,13 +721,12 @@ class WarmStartLoss(nn.Module):
 
         # Phase 1 losses (stability)
         self.sisnr_loss = SISNRLoss()
-        self.stft_loss = MultiResolutionSTFTLoss(fft_sizes=fft_sizes, device=device)
+        self.stft_loss = MultiResolutionSTFTLoss(fft_sizes=tuple(fft_sizes))
 
         # Phase 2 loss (perceptual quality)
         self.perceptual_loss = PerceptualLoss(
-            fft_sizes=fft_sizes,
             use_harmonic=False,  # Disabled by default for stability
-            device=device
+            sample_rate=sample_rate
         )
 
         print(f"[WarmStartLoss] Initialized:")
@@ -758,7 +773,8 @@ class WarmStartLoss(nn.Module):
             return total
         else:
             # Phase 2: Quality-focused (full perceptual loss)
-            return self.perceptual_loss(pred, target)
+            total, _ = self.perceptual_loss(pred, target)
+            return total
 
     def forward_with_breakdown(self, pred: torch.Tensor, target: torch.Tensor) -> dict:
         """
@@ -790,13 +806,13 @@ class WarmStartLoss(nn.Module):
             return breakdown
 
 
-def create_warmstart_loss(warmup_epochs: int = 3, device: str = 'cuda') -> WarmStartLoss:
+def create_warmstart_loss(warmup_epochs: int = 3, sample_rate: int = 16000) -> WarmStartLoss:
     """
     Factory function to create WarmStartLoss with recommended settings.
 
     Args:
         warmup_epochs: Number of epochs for Phase 1 (default: 3)
-        device: 'cuda' or 'cpu'
+        sample_rate: Audio sample rate (default: 16000)
 
     Returns:
         WarmStartLoss instance
@@ -806,5 +822,5 @@ def create_warmstart_loss(warmup_epochs: int = 3, device: str = 'cuda') -> WarmS
         phase1_sisnr_weight=0.6,
         phase1_stft_weight=0.4,
         fft_sizes=[256, 512, 1024],
-        device=device
+        sample_rate=sample_rate
     )
