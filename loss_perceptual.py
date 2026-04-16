@@ -342,16 +342,19 @@ class MelSpectrogramLoss(nn.Module):
 
 class SISNRLoss(nn.Module):
     """
-    Scale-Invariant Signal-to-Noise Ratio loss.
+    Scale-Invariant Signal-to-Noise Ratio loss with NORMALIZATION.
 
-    Standard loss for speech enhancement/separation.
-    Directly correlates with perceptual quality.
-    Used as stabilizing term with lower weight.
+    CRITICAL FIX: Raw SI-SNR values are ~30-50, while spectral losses are ~0.5-2.
+    Without normalization, SI-SNR dominates even with low weight.
+
+    Solution: Divide by typical SI-SNR value (30) to normalize to ~1-2 range.
+    This ensures balanced contribution with spectral losses.
     """
 
-    def __init__(self, eps=1e-5):
+    def __init__(self, eps=1e-5, normalize_scale=30.0):
         super().__init__()
         self.eps = eps
+        self.normalize_scale = normalize_scale  # Divide output by this value
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
@@ -359,7 +362,7 @@ class SISNRLoss(nn.Module):
             pred: [B, N] or [B, 1, N] predicted waveform
             target: [B, N] or [B, 1, N] clean waveform
         Returns:
-            Negative SI-SNR (to minimize)
+            Normalized negative SI-SNR (to minimize)
         """
         if pred.dim() == 3:
             pred = pred.squeeze(1)
@@ -390,7 +393,11 @@ class SISNRLoss(nn.Module):
         si_snr = 10 * torch.log10(ratio + self.eps)
         si_snr = torch.clamp(si_snr, -100, 100)
 
-        return -si_snr.mean()  # Negative because we minimize
+        # NORMALIZE to match spectral loss scale (~1-2 range)
+        # Raw negative SI-SNR is ~30-50, divide by 30 to get ~1-2
+        normalized = -si_snr.mean() / self.normalize_scale
+
+        return normalized
 
 
 # =============================================================================

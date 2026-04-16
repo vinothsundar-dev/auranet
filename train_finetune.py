@@ -340,7 +340,9 @@ class PerceptualFineTuner:
                 if self.is_warmstart:
                     # WarmStartLoss returns just the loss value
                     loss = self.criterion(enhanced_audio, clean_audio_batch)
-                    loss_dict = {'total': loss}
+                    # Get breakdown for logging
+                    breakdown = self.criterion.forward_with_breakdown(enhanced_audio, clean_audio_batch)
+                    loss_dict = breakdown
                 else:
                     # PerceptualLoss returns (loss, loss_dict)
                     loss, loss_dict = self.criterion(
@@ -360,7 +362,13 @@ class PerceptualFineTuner:
             # Gradient clipping (unscale first for correct norm)
             if self.grad_clip > 0:
                 self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+            else:
+                grad_norm = 0.0
+
+            # Log gradient norm for first batch (debug)
+            if batch_idx == 0:
+                print(f"  [DEBUG] Batch 0: loss={loss.item():.4f}, grad_norm={grad_norm:.4f}")
 
             # Optimizer step with scaler
             self.scaler.step(self.optimizer)
@@ -549,6 +557,14 @@ class PerceptualFineTuner:
         for epoch in range(self.current_epoch, self.num_epochs):
             self.current_epoch = epoch
             t0 = time.time()
+
+            # === MANDATORY DEBUG LOGGING ===
+            lr_now = self.optimizer.param_groups[0]['lr']
+            if self.is_warmstart:
+                phase = "Warmup (SI-SNR+STFT)" if (epoch + 1) <= self.warmup_epochs else "Perceptual"
+            else:
+                phase = "Perceptual"
+            print(f"\n[DEBUG] Epoch {epoch+1}: LR={lr_now:.2e}, Phase={phase}")
 
             # Update warm-start loss epoch (1-indexed)
             if self.is_warmstart:
