@@ -130,7 +130,7 @@ class Trainer:
         train_config = config.get("training", {})
         self.optimizer = optim.AdamW(
             self.model.parameters(),
-            lr=train_config.get("learning_rate", 0.001),
+            lr=train_config.get("learning_rate", 0.0001),  # FIXED: default 1e-4
             weight_decay=train_config.get("weight_decay", 0.01),
         )
 

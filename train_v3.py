@@ -18,6 +18,15 @@
 #   python train_v3.py --synthetic --epochs 50
 # =============================================================================
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 🔵 DEBUG MARKER — Identifies which training script is running
+# ═══════════════════════════════════════════════════════════════════════════
+print("═" * 70)
+print("🔵 RUNNING: train_v3.py (BASE TRAINING)")
+print("📌 LR default: 1e-4 | Output: tanh | Loss: AuraNetV3Loss")
+print("⚠️  For perceptual fine-tuning, use train_finetune.py instead!")
+print("═" * 70)
+
 import os
 import sys
 import argparse
@@ -128,7 +137,7 @@ class TrainerV3:
 
         # Optimizer
         train_cfg = config.get("training", {})
-        self.lr = train_cfg.get("learning_rate", 0.001)
+        self.lr = train_cfg.get("learning_rate", 0.0001)  # FIXED: default 1e-4 for perceptual training
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=self.lr,
@@ -198,9 +207,9 @@ class TrainerV3:
                 with torch.amp.autocast("cuda"):
                     enhanced_stft, _, _ = self.model(noisy_stft)
                     enhanced_audio = self.stft.inverse(enhanced_stft)
-                    # Numerical safety: clamp output
+                    # Numerical safety: replace NaN/Inf, then use tanh (NOT clamp)
                     enhanced_audio = torch.nan_to_num(enhanced_audio, nan=0.0, posinf=1.0, neginf=-1.0)
-                    enhanced_audio = torch.clamp(enhanced_audio, -1.0, 1.0)
+                    enhanced_audio = torch.tanh(enhanced_audio)  # FIXED: tanh instead of clamp
                     enhanced_audio = enhanced_audio + 1e-6
                     loss, ld = self.criterion(enhanced_stft, clean_stft,
                                               enhanced_audio, clean_audio)
@@ -220,9 +229,9 @@ class TrainerV3:
             else:
                 enhanced_stft, _, _ = self.model(noisy_stft)
                 enhanced_audio = self.stft.inverse(enhanced_stft)
-                # Numerical safety: clamp output
+                # Numerical safety: replace NaN/Inf, then use tanh (NOT clamp)
                 enhanced_audio = torch.nan_to_num(enhanced_audio, nan=0.0, posinf=1.0, neginf=-1.0)
-                enhanced_audio = torch.clamp(enhanced_audio, -1.0, 1.0)
+                enhanced_audio = torch.tanh(enhanced_audio)  # FIXED: tanh instead of clamp
                 enhanced_audio = enhanced_audio + 1e-6
                 loss, ld = self.criterion(enhanced_stft, clean_stft,
                                           enhanced_audio, clean_audio)

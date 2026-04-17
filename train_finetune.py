@@ -21,6 +21,15 @@
 #
 # =============================================================================
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 🚀 HARD DEBUG MARKER — Confirms this is the CORRECT perceptual pipeline
+# ═══════════════════════════════════════════════════════════════════════════
+print("═" * 70)
+print("🚀 RUNNING: train_finetune.py (PERCEPTUAL PIPELINE)")
+print("🔥 Using: PerceptualLoss with LoudLoss + MR-STFT + Mel + SI-SNR")
+print("📌 LR default: 1e-4 | Output: tanh (NOT clamp) | Warm-start: available")
+print("═" * 70)
+
 import os
 import sys
 import argparse

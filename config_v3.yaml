@@ -31,9 +31,9 @@ loss:
 training:
   batch_size: 16
   num_epochs: 100
-  learning_rate: 0.001
+  learning_rate: 0.0001   # FIXED: 1e-4 for perceptual fine-tuning (was 0.001)
   weight_decay: 0.01
-  gradient_clip: 5.0
+  gradient_clip: 3.0      # FIXED: reduced from 5.0 for stability
   warmup_epochs: 5
   lr_patience: 5           # ReduceLROnPlateau patience
   early_stop_patience: 15
