@@ -18,6 +18,15 @@
 #   python train_v3.py --synthetic --epochs 50
 # =============================================================================
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 🔵 DEBUG MARKER — Identifies which training script is running
+# ═══════════════════════════════════════════════════════════════════════════
+print("═" * 70)
+print("🔵 RUNNING: train_v3.py (BASE TRAINING)")
+print("📌 LR default: 1e-4 | Output: tanh | Loss: AuraNetV3Loss")
+print("⚠️  For perceptual fine-tuning, use train_finetune.py instead!")
+print("═" * 70)
+
 import os
 import sys
 import argparse
@@ -26,12 +35,32 @@ from pathlib import Path
 from typing import Dict, Optional
 from copy import deepcopy
 
+# =============================================================================
+# Performance Configuration - MUST be before torch imports
+# =============================================================================
+# Disable CUDA_LAUNCH_BLOCKING for performance (don't sync after every kernel)
+os.environ.setdefault('CUDA_LAUNCH_BLOCKING', '0')
+
 import yaml
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from tqdm import tqdm
+
+# Disable cuDNN benchmark to avoid warmup stalls
+# benchmark=True can cause long initial delays while cuDNN searches for optimal algorithms
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = False  # Allow non-deterministic for speed
+
+# Disable torch._dynamo completely to avoid hidden compilation overhead
+try:
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True
+    torch._dynamo.disable()
+except (ImportError, AttributeError):
+    pass  # Older PyTorch version without dynamo
 
 from model_v3 import AuraNetV3, create_auranet_v3
 from loss_v3 import AuraNetV3Loss
@@ -108,7 +137,7 @@ class TrainerV3:
 
         # Optimizer
         train_cfg = config.get("training", {})
-        self.lr = train_cfg.get("learning_rate", 0.001)
+        self.lr = train_cfg.get("learning_rate", 0.0001)  # FIXED: default 1e-4 for perceptual training
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=self.lr,
@@ -125,12 +154,12 @@ class TrainerV3:
 
         # Training config
         self.num_epochs = train_cfg.get("num_epochs", 100)
-        self.grad_clip = train_cfg.get("gradient_clip", 5.0)
+        self.grad_clip = train_cfg.get("gradient_clip", 3.0)
         self.warmup_epochs = train_cfg.get("warmup_epochs", 5)
         self.patience = train_cfg.get("early_stop_patience", 15)
 
-        # AMP (CUDA only)
-        self.use_amp = train_cfg.get("use_amp", True) and self.device.type == "cuda"
+        # AMP (CUDA only) — disabled by default for stability
+        self.use_amp = train_cfg.get("use_amp", False) and self.device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
 
         # EMA
@@ -158,7 +187,16 @@ class TrainerV3:
         loss_sums = {}
         n = 0
 
-        for batch_idx, batch in enumerate(loader):
+        # Use tqdm with mininterval=0 to ensure updates from first batch
+        pbar = tqdm(
+            enumerate(loader),
+            total=len(loader),
+            desc=f"Epoch {self.current_epoch + 1}",
+            mininterval=0,  # Update immediately from first batch
+            leave=True
+        )
+
+        for batch_idx, batch in pbar:
             noisy_stft = batch["noisy_stft"].to(self.device)
             clean_stft = batch["clean_stft"].to(self.device)
             clean_audio = batch["clean_audio"].to(self.device)
@@ -169,8 +207,18 @@ class TrainerV3:
                 with torch.amp.autocast("cuda"):
                     enhanced_stft, _, _ = self.model(noisy_stft)
                     enhanced_audio = self.stft.inverse(enhanced_stft)
+                    # Numerical safety: replace NaN/Inf, then use tanh (NOT clamp)
+                    enhanced_audio = torch.nan_to_num(enhanced_audio, nan=0.0, posinf=1.0, neginf=-1.0)
+                    enhanced_audio = torch.tanh(enhanced_audio)  # FIXED: tanh instead of clamp
+                    enhanced_audio = enhanced_audio + 1e-6
                     loss, ld = self.criterion(enhanced_stft, clean_stft,
                                               enhanced_audio, clean_audio)
+
+                # NaN/Inf guard
+                if not torch.isfinite(loss):
+                    print(f"  [WARN] Skipping batch {batch_idx} — non-finite loss")
+                    self.optimizer.zero_grad()
+                    continue
 
                 self.scaler.scale(loss).backward()
                 if self.grad_clip > 0:
@@ -181,8 +229,19 @@ class TrainerV3:
             else:
                 enhanced_stft, _, _ = self.model(noisy_stft)
                 enhanced_audio = self.stft.inverse(enhanced_stft)
+                # Numerical safety: replace NaN/Inf, then use tanh (NOT clamp)
+                enhanced_audio = torch.nan_to_num(enhanced_audio, nan=0.0, posinf=1.0, neginf=-1.0)
+                enhanced_audio = torch.tanh(enhanced_audio)  # FIXED: tanh instead of clamp
+                enhanced_audio = enhanced_audio + 1e-6
                 loss, ld = self.criterion(enhanced_stft, clean_stft,
                                           enhanced_audio, clean_audio)
+
+                # NaN/Inf guard
+                if not torch.isfinite(loss):
+                    print(f"  [WARN] Skipping batch {batch_idx} — non-finite loss")
+                    self.optimizer.zero_grad()
+                    continue
+
                 loss.backward()
                 if self.grad_clip > 0:
                     nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
@@ -194,8 +253,8 @@ class TrainerV3:
                 loss_sums[k] = loss_sums.get(k, 0.0) + v.item()
             n += 1
 
-            if batch_idx % 50 == 0:
-                print(f"  batch {batch_idx}/{len(loader)} | loss {loss.item():.4f}")
+            # Update tqdm progress bar with current loss
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
         avg = {k: v / n for k, v in loss_sums.items()}
         avg["total"] = total_loss / n

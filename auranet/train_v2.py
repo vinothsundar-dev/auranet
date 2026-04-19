@@ -45,11 +45,30 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, Any
 from tqdm import tqdm
 
+# =============================================================================
+# Performance Configuration - MUST be before torch imports
+# =============================================================================
+# Disable CUDA_LAUNCH_BLOCKING for performance (don't sync after every kernel)
+os.environ.setdefault('CUDA_LAUNCH_BLOCKING', '0')
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
+
+# Disable cuDNN benchmark to avoid warmup stalls
+# benchmark=True can cause long initial delays while cuDNN searches for optimal algorithms
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = False  # Allow non-deterministic for speed
+
+# Disable torch._dynamo completely to avoid hidden compilation overhead
+try:
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True
+    torch._dynamo.disable()
+except (ImportError, AttributeError):
+    pass  # Older PyTorch version without dynamo
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -113,7 +132,7 @@ DEFAULT_CONFIG = {
 
 class WarmupCosineScheduler:
     """Learning rate scheduler with linear warmup and cosine decay."""
-    
+
     def __init__(
         self,
         optimizer: optim.Optimizer,
@@ -126,7 +145,7 @@ class WarmupCosineScheduler:
         self.total_epochs = total_epochs
         self.min_lr = min_lr
         self.base_lrs = [group['lr'] for group in optimizer.param_groups]
-        
+
     def step(self, epoch: int) -> float:
         """Update learning rate based on epoch."""
         if epoch < self.warmup_epochs:
@@ -136,10 +155,10 @@ class WarmupCosineScheduler:
             # Cosine decay
             progress = (epoch - self.warmup_epochs) / max(1, self.total_epochs - self.warmup_epochs)
             scale = 0.5 * (1 + math.cos(math.pi * progress))
-        
+
         for i, group in enumerate(self.optimizer.param_groups):
             group['lr'] = max(self.base_lrs[i] * scale, self.min_lr)
-        
+
         return self.optimizer.param_groups[0]['lr']
 
 
@@ -150,19 +169,19 @@ class WarmupCosineScheduler:
 class TrainerV2:
     """
     AuraNet V2 Trainer with 2-Stage Training Support.
-    
+
     FEATURES:
     - Model creation (V1 or V2)
     - Psychoacoustic loss computation
     - 2-stage training logic
     - Mixed precision training
     - Checkpointing and resume
-    
+
     2-STAGE TRAINING:
     Stage 1 (80% of epochs): Focus on separation with loud-loss + SI-SDR
     Stage 2 (20% of epochs): Fine-tune WDRC with envelope loss
     """
-    
+
     def __init__(
         self,
         config: Dict[str, Any],
@@ -172,51 +191,51 @@ class TrainerV2:
     ):
         self.config = config
         self.device = device
-        
+
         # Create model
         self.model = self._create_model()
         self.model.to(device)
-        
+
         # Create STFT module for audio reconstruction
         self.stft = CausalSTFT(
             n_fft=256,
             hop_length=80,
             win_length=160,
         ).to(device)
-        
+
         # Create loss function
         self.criterion = self._create_criterion()
-        
+
         # Create optimizer with parameter groups (separate WDRC)
         self.optimizer = self._create_optimizer()
-        
+
         # Create scheduler
         self.scheduler = WarmupCosineScheduler(
             self.optimizer,
             warmup_epochs=config["training"]["warmup_epochs"],
             total_epochs=config["training"]["epochs"],
         )
-        
+
         # Mixed precision training
         self.scaler = GradScaler()
         self.use_amp = torch.cuda.is_available()
-        
+
         # Training state
         self.current_epoch = 0
         self.current_stage = 1
         self.best_loss = float('inf')
-        
+
         # Create data loaders
         self.train_loader, self.val_loader = self._create_data_loaders(data_dir)
-        
+
         # Resume from checkpoint if provided
         if resume_from:
             self.load_checkpoint(resume_from)
-            
+
     def _create_model(self) -> nn.Module:
         """Create model based on config version."""
         version = self.config["model"].get("version", "v2")
-        
+
         if version == "v2":
             model = AuraNetV2(
                 encoder_channels=tuple(self.config["model"]["encoder_channels"]),
@@ -234,13 +253,13 @@ class TrainerV2:
         else:
             model = create_auranet(self.config)
             print(f"✅ Created AuraNet V1 with {model.count_parameters():,} parameters")
-            
+
         return model
-        
+
     def _create_criterion(self) -> nn.Module:
         """Create loss function based on config."""
         version = self.config["model"].get("version", "v2")
-        
+
         if version == "v2":
             criterion = AuraNetV2Loss(
                 weight_loud=self.config["loss"]["weight_loud"],
@@ -255,50 +274,50 @@ class TrainerV2:
         else:
             criterion = AuraNetLoss()
             print(f"✅ Using V1 Loss (Complex MSE + Multi-Res STFT)")
-            
+
         return criterion
-        
+
     def _create_optimizer(self) -> optim.Optimizer:
         """
         Create optimizer with separate parameter groups.
-        
+
         WDRC parameters are grouped separately for stage-2 fine-tuning.
         """
         wdrc_params = []
         other_params = []
-        
+
         for name, param in self.model.named_parameters():
             if "wdrc" in name.lower():
                 wdrc_params.append(param)
             else:
                 other_params.append(param)
-        
+
         param_groups = [
             {"params": other_params, "lr": self.config["training"]["learning_rate"]},
             {"params": wdrc_params, "lr": self.config["training"]["learning_rate"], "name": "wdrc"},
         ]
-        
+
         optimizer = optim.AdamW(
             param_groups,
             weight_decay=self.config["training"]["weight_decay"],
         )
-        
+
         print(f"✅ Optimizer: AdamW (LR={self.config['training']['learning_rate']})")
-        
+
         return optimizer
-        
+
     def _create_data_loaders(
         self,
         data_dir: str,
     ) -> Tuple[DataLoader, DataLoader]:
         """Create training and validation data loaders."""
-        
+
         speech_dir = os.path.join(data_dir, "speech")
         noise_dir = os.path.join(data_dir, "noise")
-        
+
         # Check if directories exist
         has_data = os.path.exists(speech_dir) and os.path.exists(noise_dir)
-        
+
         if has_data:
             # Real data mode
             train_dataset = AuraNetDataset(
@@ -309,7 +328,7 @@ class TrainerV2:
                 snr_range=tuple(self.config["data"]["snr_range"]),
                 augment=True,
             )
-            
+
             val_dataset = AuraNetDataset(
                 clean_dir=speech_dir,
                 noise_dir=noise_dir,
@@ -321,7 +340,7 @@ class TrainerV2:
         else:
             train_dataset = None
             val_dataset = None
-        
+
         # Fallback to synthetic if no real data
         if train_dataset is None or len(train_dataset) == 0:
             print("⚠️ No real data found, using synthetic mode")
@@ -333,66 +352,69 @@ class TrainerV2:
                 synthetic_mode=True,
                 num_synthetic_samples=100,
             )
-        
+
+        # Limit num_workers to avoid excessive overhead - 2 is recommended for most systems
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config["training"]["batch_size"],
             shuffle=True,
-            num_workers=4 if torch.cuda.is_available() else 0,
+            num_workers=min(2, os.cpu_count() or 1),  # Limited to avoid startup delays
             pin_memory=torch.cuda.is_available(),
             drop_last=True,
+            persistent_workers=False,  # Avoid worker persistence overhead
         )
-        
+
         val_loader = DataLoader(
             val_dataset,
             batch_size=self.config["training"]["batch_size"],
             shuffle=False,
-            num_workers=2 if torch.cuda.is_available() else 0,
+            num_workers=min(1, os.cpu_count() or 1),  # Minimal for validation
             pin_memory=torch.cuda.is_available(),
+            persistent_workers=False,
         )
-        
+
         print(f"📊 Dataset: {len(train_dataset)} train, {len(val_dataset)} validation samples")
-        
+
         return train_loader, val_loader
-        
+
     def set_stage(self, stage: int) -> None:
         """
         Set training stage and adjust learning rates.
-        
+
         Stage 1: Separation training
         - Full model training
         - WDRC with lower learning rate (0.1x)
-        
+
         Stage 2: WDRC fine-tuning
         - Reduce main model LR (0.5x)
         - Full WDRC learning rate
         - Add envelope loss
         """
         self.current_stage = stage
-        
+
         # Update loss weights for stage
         if hasattr(self.criterion, 'set_stage'):
             self.criterion.set_stage(stage)
-        
+
         if stage == 1:
             print("\n" + "="*60)
             print("🔧 STAGE 1: Separation Training")
             print("   Focus: Deep filtering quality, noise reduction")
             print("   Loss: Loud-Loss + SI-SDR + Multi-Res STFT")
             print("="*60)
-            
+
             # WDRC with reduced learning rate
             for group in self.optimizer.param_groups:
                 if group.get("name") == "wdrc":
                     group["lr"] = self.config["training"]["learning_rate"] * 0.1
-                    
+
         elif stage == 2:
             print("\n" + "="*60)
             print("🔧 STAGE 2: WDRC Fine-tuning")
             print("   Focus: Dynamic range, loudness consistency")
             print("   Loss: + Envelope loss, adjusted weights")
             print("="*60)
-            
+
             # WDRC with full learning rate
             wdrc_mult = self.config["training"].get("stage2_wdrc_lr_mult", 1.0)
             for group in self.optimizer.param_groups:
@@ -401,39 +423,39 @@ class TrainerV2:
                 else:
                     # Reduce other params slightly
                     group["lr"] = self.config["training"]["learning_rate"] * 0.5
-                    
+
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch."""
         self.model.train()
-        
+
         total_loss = 0.0
         loss_components = {}
-        
+
         pbar = tqdm(
             self.train_loader,
             desc=f"Epoch {self.current_epoch+1} [Stage {self.current_stage}]"
         )
-        
+
         for batch_idx, batch in enumerate(pbar):
             # Move data to device
             noisy_stft = batch['noisy_stft'].to(self.device)
             clean_stft = batch['clean_stft'].to(self.device)
             clean_audio = batch.get('clean_audio')
-            
+
             if clean_audio is not None:
                 clean_audio = clean_audio.to(self.device)
-            
+
             # Zero gradients
             self.optimizer.zero_grad()
-            
+
             # Forward pass with mixed precision
             with autocast(enabled=self.use_amp):
                 enhanced_stft, wdrc_params, _ = self.model(noisy_stft)
-                
+
                 # Reconstruct audio for time-domain loss
                 if clean_audio is not None:
                     enhanced_audio = self.stft.inverse(enhanced_stft)
-                    
+
                     # Match lengths
                     min_len = min(enhanced_audio.shape[-1], clean_audio.shape[-1])
                     enhanced_audio = enhanced_audio[..., :min_len]
@@ -441,7 +463,7 @@ class TrainerV2:
                 else:
                     enhanced_audio = None
                     clean_audio_batch = None
-                
+
                 # Compute loss
                 loss, loss_dict = self.criterion(
                     enhanced_stft,
@@ -449,58 +471,58 @@ class TrainerV2:
                     enhanced_audio,
                     clean_audio_batch,
                 )
-            
+
             # Backward pass with gradient scaling
             self.scaler.scale(loss).backward()
-            
+
             # Gradient clipping
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
                 self.config["training"]["grad_clip"]
             )
-            
+
             # Optimizer step
             self.scaler.step(self.optimizer)
             self.scaler.update()
-            
+
             # Accumulate losses
             total_loss += loss.item()
             for key, value in loss_dict.items():
                 if key not in loss_components:
                     loss_components[key] = 0.0
                 loss_components[key] += value.item() if torch.is_tensor(value) else value
-            
+
             # Update progress bar
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-        
+
         # Average losses
         n_batches = len(self.train_loader)
         avg_loss = total_loss / n_batches
-        
+
         for key in loss_components:
             loss_components[key] /= n_batches
-        
+
         return {"loss": avg_loss, **loss_components}
-        
+
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
         """Validate model on validation set."""
         self.model.eval()
-        
+
         total_loss = 0.0
         loss_components = {}
-        
+
         for batch in tqdm(self.val_loader, desc="Validating", leave=False):
             noisy_stft = batch['noisy_stft'].to(self.device)
             clean_stft = batch['clean_stft'].to(self.device)
             clean_audio = batch.get('clean_audio')
-            
+
             if clean_audio is not None:
                 clean_audio = clean_audio.to(self.device)
-            
+
             enhanced_stft, _, _ = self.model(noisy_stft)
-            
+
             if clean_audio is not None:
                 enhanced_audio = self.stft.inverse(enhanced_stft)
                 min_len = min(enhanced_audio.shape[-1], clean_audio.shape[-1])
@@ -509,33 +531,33 @@ class TrainerV2:
             else:
                 enhanced_audio = None
                 clean_audio_batch = None
-            
+
             loss, loss_dict = self.criterion(
                 enhanced_stft,
                 clean_stft,
                 enhanced_audio,
                 clean_audio_batch,
             )
-            
+
             total_loss += loss.item()
             for key, value in loss_dict.items():
                 if key not in loss_components:
                     loss_components[key] = 0.0
                 loss_components[key] += value.item() if torch.is_tensor(value) else value
-        
+
         n_batches = len(self.val_loader)
         avg_loss = total_loss / n_batches
-        
+
         for key in loss_components:
             loss_components[key] /= n_batches
-        
+
         return {"loss": avg_loss, **loss_components}
-        
+
     def save_checkpoint(self, filename: str, is_best: bool = False) -> None:
         """Save training checkpoint."""
         save_dir = Path(self.config["checkpoint"]["save_dir"])
         save_dir.mkdir(parents=True, exist_ok=True)
-        
+
         checkpoint = {
             "epoch": self.current_epoch,
             "stage": self.current_stage,
@@ -544,35 +566,35 @@ class TrainerV2:
             "best_loss": self.best_loss,
             "config": self.config,
         }
-        
+
         torch.save(checkpoint, save_dir / filename)
-        
+
         if is_best:
             torch.save(checkpoint, save_dir / "best_model.pt")
             print(f"💾 Saved best model (loss: {self.best_loss:.4f})")
-            
+
     def load_checkpoint(self, path: str) -> None:
         """Load training checkpoint."""
         checkpoint = torch.load(path, map_location=self.device)
-        
+
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.current_epoch = checkpoint["epoch"]
         self.current_stage = checkpoint.get("stage", 1)
         self.best_loss = checkpoint.get("best_loss", float('inf'))
-        
+
         print(f"✅ Resumed from checkpoint (epoch {self.current_epoch}, stage {self.current_stage})")
-        
+
     def train(self, start_stage: int = 1) -> None:
         """
         Full training loop with 2-stage training.
-        
+
         Args:
             start_stage: Which stage to start from (1 or 2)
         """
         total_epochs = self.config["training"]["epochs"]
         stage1_epochs = int(total_epochs * self.config["training"]["stage1_epochs_ratio"])
-        
+
         print(f"\n{'='*60}")
         print(f"🚀 AuraNet V2 Training")
         print(f"{'='*60}")
@@ -582,49 +604,49 @@ class TrainerV2:
         print(f"   Device: {self.device}")
         print(f"   Batch size: {self.config['training']['batch_size']}")
         print(f"{'='*60}\n")
-        
+
         # Set initial stage
         if start_stage == 2:
             self.current_stage = 2
             self.current_epoch = stage1_epochs
-        
+
         self.set_stage(self.current_stage)
-        
+
         for epoch in range(self.current_epoch, total_epochs):
             self.current_epoch = epoch
-            
+
             # Check for stage transition
             if epoch == stage1_epochs and self.current_stage == 1:
                 self.set_stage(2)
                 # Save stage 1 checkpoint
                 self.save_checkpoint("stage1_final.pt")
-            
+
             # Update learning rate
             current_lr = self.scheduler.step(epoch)
             print(f"\n📈 Epoch {epoch+1}/{total_epochs} | LR: {current_lr:.2e} | Stage: {self.current_stage}")
-            
+
             # Train
             train_metrics = self.train_epoch()
             print(f"   Train Loss: {train_metrics['loss']:.4f}")
-            
+
             # Log individual losses
             for key, value in train_metrics.items():
                 if key != 'loss' and key != 'total':
                     print(f"      {key}: {value:.4f}")
-            
+
             # Validate
             val_metrics = self.validate()
             print(f"   Val Loss: {val_metrics['loss']:.4f}")
-            
+
             # Check for best model
             is_best = val_metrics['loss'] < self.best_loss
             if is_best:
                 self.best_loss = val_metrics['loss']
-            
+
             # Save checkpoint
             if (epoch + 1) % self.config["checkpoint"]["save_every"] == 0:
                 self.save_checkpoint(f"checkpoint_epoch{epoch+1}.pt", is_best)
-        
+
         # Save final model
         self.save_checkpoint("final_model.pt")
         print(f"\n✅ Training complete! Best loss: {self.best_loss:.4f}")
@@ -642,18 +664,18 @@ def parse_args():
 Examples:
   # Full 2-stage training
   python train_v2.py --data-dir datasets --epochs 100
-  
+
   # Stage 1 only
   python train_v2.py --data-dir datasets --stage 1 --epochs 80
-  
-  # Stage 2 from checkpoint  
+
+  # Stage 2 from checkpoint
   python train_v2.py --stage 2 --checkpoint checkpoints/stage1_final.pt
-  
+
   # Use V1 model (backward compatibility)
   python train_v2.py --model v1
         """
     )
-    
+
     parser.add_argument(
         "--config", type=str, default=None,
         help="Path to config YAML file"
@@ -690,13 +712,13 @@ Examples:
         "--device", type=str, default=None,
         help="Device (cuda, mps, cpu)"
     )
-    
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    
+
     # Load config
     if args.config and os.path.exists(args.config):
         with open(args.config) as f:
@@ -707,7 +729,7 @@ def main():
                 config[key] = DEFAULT_CONFIG[key]
     else:
         config = DEFAULT_CONFIG.copy()
-    
+
     # Override from command line
     if args.epochs:
         config["training"]["epochs"] = args.epochs
@@ -717,7 +739,7 @@ def main():
         config["training"]["learning_rate"] = args.lr
     if args.model:
         config["model"]["version"] = args.model
-    
+
     # Select device
     if args.device:
         device = torch.device(args.device)
@@ -730,7 +752,7 @@ def main():
     else:
         device = torch.device("cpu")
         print("⚠️ Using CPU - training will be slow!")
-    
+
     # Create trainer
     trainer = TrainerV2(
         config=config,
@@ -738,7 +760,7 @@ def main():
         device=device,
         resume_from=args.checkpoint,
     )
-    
+
     # Train
     trainer.train(start_stage=args.stage)
 

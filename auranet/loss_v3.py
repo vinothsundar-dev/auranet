@@ -36,7 +36,7 @@ class SISNRLoss(nn.Module):
           e_noise  = s_hat - s_target
     """
 
-    def __init__(self, eps=1e-8):
+    def __init__(self, eps=1e-5):
         super().__init__()
         self.eps = eps
 
@@ -69,10 +69,11 @@ class SISNRLoss(nn.Module):
         # e_noise = s_hat - s_target
         e_noise = pred - s_target
 
-        si_snr = 10 * torch.log10(
-            torch.sum(s_target ** 2, dim=-1) /
-            (torch.sum(e_noise ** 2, dim=-1) + self.eps)
-        )
+        signal_energy = torch.sum(s_target ** 2, dim=-1) + self.eps
+        noise_energy = torch.sum(e_noise ** 2, dim=-1) + self.eps
+        ratio = torch.clamp(signal_energy / (noise_energy + self.eps), min=self.eps, max=1e6)
+        si_snr = 10 * torch.log10(ratio + self.eps)
+        si_snr = torch.clamp(si_snr, min=-100.0, max=100.0)
 
         return -si_snr.mean()  # negative because we minimize
 
@@ -96,9 +97,10 @@ class CompressedMSELoss(nn.Module):
         """Apply power-law compression to complex STFT."""
         real = stft[:, 0]  # [B, T, F]
         imag = stft[:, 1]
-        mag = torch.sqrt(real ** 2 + imag ** 2 + 1e-8)
-        phase_cos = real / (mag + 1e-8)
-        phase_sin = imag / (mag + 1e-8)
+        mag = torch.sqrt(real ** 2 + imag ** 2 + 1e-5)
+        mag = torch.clamp(mag, min=1e-5)
+        phase_cos = real / (mag + 1e-5)
+        phase_sin = imag / (mag + 1e-5)
 
         mag_compressed = mag.pow(self.c)
         return mag_compressed * phase_cos, mag_compressed * phase_sin, mag_compressed
@@ -136,6 +138,7 @@ class MultiResSTFTLoss(nn.Module):
         # Register windows as buffers
         for i, wl in enumerate(win_lengths):
             self.register_buffer(f"window_{i}", torch.hann_window(wl))
+        self.eps = 1e-5
 
     def _stft_mag(self, x, fft_size, hop_size, win_length, window):
         if x.dim() == 3:
@@ -144,7 +147,7 @@ class MultiResSTFTLoss(nn.Module):
         spec = torch.stft(x, n_fft=fft_size, hop_length=hop_size,
                           win_length=win_length, window=window,
                           center=True, return_complex=True)
-        return torch.abs(spec)
+        return torch.clamp(torch.abs(spec), min=self.eps)
 
     def forward(self, pred, target):
         if pred.dim() == 3:
@@ -164,9 +167,15 @@ class MultiResSTFTLoss(nn.Module):
             pm, tm = pm[..., :min_t], tm[..., :min_t]
 
             # Spectral convergence
-            sc = torch.norm(tm - pm, p='fro') / (torch.norm(tm, p='fro') + 1e-8)
+            tm_norm = torch.norm(tm, p='fro')
+            sc = torch.norm(tm - pm, p='fro') / (tm_norm + self.eps)
+            sc = torch.clamp(sc, 0.0, 10.0)
             # Log magnitude
-            lm = F.l1_loss(torch.log(pm + 1e-8), torch.log(tm + 1e-8))
+            log_pm = torch.log(torch.clamp(pm, min=1e-5) + 1e-5)
+            log_tm = torch.log(torch.clamp(tm, min=1e-5) + 1e-5)
+            log_pm = torch.clamp(log_pm, min=-20.0, max=20.0)
+            log_tm = torch.clamp(log_tm, min=-20.0, max=20.0)
+            lm = F.l1_loss(log_pm, log_tm)
             total += sc + lm
 
         return total / len(self.fft_sizes)
@@ -182,7 +191,7 @@ class EnergyPreservationLoss(nn.Module):
     loss = |rms(enhanced) - rms(clean)| / (rms(clean) + eps)
     """
 
-    def __init__(self, eps=1e-8):
+    def __init__(self, eps=1e-5):
         super().__init__()
         self.eps = eps
 
@@ -195,12 +204,14 @@ class EnergyPreservationLoss(nn.Module):
         pred = pred[..., :min_len]
         target = target[..., :min_len]
 
-        pred_rms = torch.sqrt(torch.mean(pred ** 2, dim=-1) + self.eps)
-        target_rms = torch.sqrt(torch.mean(target ** 2, dim=-1) + self.eps)
+        pred_rms = torch.sqrt(torch.clamp(torch.mean(pred ** 2, dim=-1), min=0.0) + self.eps)
+        target_rms = torch.sqrt(torch.clamp(torch.mean(target ** 2, dim=-1), min=0.0) + self.eps)
+        pred_rms = torch.clamp(pred_rms, min=self.eps)
+        target_rms = torch.clamp(target_rms, min=self.eps)
 
         # Relative energy difference
         loss = torch.abs(pred_rms - target_rms) / (target_rms + self.eps)
-        return loss.mean()
+        return torch.clamp(loss.mean(), 0.0, 10.0)
 
 
 class LogMelLoss(nn.Module):
@@ -214,7 +225,7 @@ class LogMelLoss(nn.Module):
     """
 
     def __init__(self, sample_rate=16000, n_fft=512, hop_length=160,
-                 n_mels=64, eps=1e-8):
+                 n_mels=64, eps=1e-5):
         super().__init__()
         self.n_fft = n_fft
         self.hop_length = hop_length
@@ -258,9 +269,12 @@ class LogMelLoss(nn.Module):
         spec = torch.stft(x, self.n_fft, self.hop_length,
                           window=self.window.to(x.device),
                           center=True, return_complex=True)
-        mag = torch.abs(spec)  # [B, F, T]
+        mag = torch.clamp(torch.abs(spec), min=self.eps)  # [B, F, T]
         mel = torch.matmul(mag.transpose(1, 2), self.mel_fb.to(x.device))  # [B, T, n_mels]
-        return torch.log(mel + self.eps)
+        mel = torch.clamp(mel, min=1e-5)
+        log_mel = torch.log(mel + 1e-5)
+        log_mel = torch.clamp(log_mel, min=-20.0, max=20.0)
+        return log_mel
 
     def forward(self, pred, target):
         if pred.dim() == 3:
@@ -276,7 +290,7 @@ class LogMelLoss(nn.Module):
         return F.l1_loss(pred_mel, target_mel)
 
 
-def loudness_normalize(enhanced, clean, min_scale=0.5, max_scale=2.0, eps=1e-8):
+def loudness_normalize(enhanced, clean, min_scale=0.5, max_scale=2.0, eps=1e-5):
     """
     Match RMS of enhanced audio to clean audio.
 
@@ -292,10 +306,43 @@ def loudness_normalize(enhanced, clean, min_scale=0.5, max_scale=2.0, eps=1e-8):
     Returns:
         Loudness-normalized enhanced audio [B, N]
     """
-    enhanced_rms = torch.sqrt(torch.mean(enhanced ** 2, dim=-1, keepdim=True) + eps)
-    clean_rms = torch.sqrt(torch.mean(clean ** 2, dim=-1, keepdim=True) + eps)
+    enhanced_rms = torch.sqrt(torch.clamp(torch.mean(enhanced ** 2, dim=-1, keepdim=True), min=0.0) + eps)
+    clean_rms = torch.sqrt(torch.clamp(torch.mean(clean ** 2, dim=-1, keepdim=True), min=0.0) + eps)
+    enhanced_rms = torch.clamp(enhanced_rms, min=eps)
+    clean_rms = torch.clamp(clean_rms, min=eps)
     scale = (clean_rms / (enhanced_rms + eps)).clamp(min_scale, max_scale)
     return enhanced * scale
+
+
+class TemporalConsistencyLoss(nn.Module):
+    """
+    Penalizes abrupt frame-to-frame changes in the enhanced STFT.
+
+    Computed as L1 of the first-order temporal difference between
+    enhanced and clean STFT magnitude. Reduces musical noise / flutter
+    artifacts without requiring architecture changes.
+    """
+
+    def __init__(self, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, pred_stft, target_stft):
+        """
+        Args:
+            pred_stft: [B, 2, T, F]
+            target_stft: [B, 2, T, F]
+        """
+        pred_mag = torch.sqrt(pred_stft[:, 0] ** 2 + pred_stft[:, 1] ** 2 + self.eps)
+        tgt_mag = torch.sqrt(target_stft[:, 0] ** 2 + target_stft[:, 1] ** 2 + self.eps)
+        pred_mag = torch.clamp(pred_mag, min=self.eps)
+        tgt_mag = torch.clamp(tgt_mag, min=self.eps)
+
+        # Temporal difference: how magnitude changes between adjacent frames
+        pred_diff = pred_mag[:, 1:, :] - pred_mag[:, :-1, :]
+        tgt_diff = tgt_mag[:, 1:, :] - tgt_mag[:, :-1, :]
+
+        return F.l1_loss(pred_diff, tgt_diff)
 
 
 class AuraNetV3Loss(nn.Module):
@@ -303,35 +350,39 @@ class AuraNetV3Loss(nn.Module):
     Combined loss for AuraNet V3 — Perceptual quality focused.
 
     Total = w1*SI-SNR + w2*CompressedMSE + w3*MultiResSTFT
-          + w4*EnergyPreservation + w5*LogMel
+          + w4*EnergyPreservation + w5*LogMel + w6*TemporalConsistency
 
-    Weight rationale:
+    Weight rationale (v3.1 rebalance):
     - SI-SNR (1.0): Primary perceptual driver — correlates with MOS
-    - Compressed MSE (0.3): Freq detail for consonants (reduced from 0.5)
-    - Multi-res STFT (0.2): Spectral shape (reduced from 0.3)
+    - Multi-res STFT (0.8): Increased — better spectral shape, less metallic
+    - Compressed MSE (0.5): Increased — freq detail for consonants
+    - Log-mel (0.3): Increased — perceptual frequency weighting
     - Energy preservation (0.1): Prevents over-suppression / softness
-    - Log-mel (0.15): Perceptual frequency weighting
+    - Temporal consistency (0.1): Reduces musical noise / flutter
     """
 
     def __init__(self,
                  weight_sisnr=1.0,
-                 weight_compressed_mse=0.3,
-                 weight_stft=0.2,
+                 weight_compressed_mse=0.5,
+                 weight_stft=0.8,
                  compress_factor=0.3,
                  weight_energy=0.1,
-                 weight_logmel=0.15):
+                 weight_logmel=0.3,
+                 weight_temporal=0.1):
         super().__init__()
         self.w_sisnr = weight_sisnr
         self.w_cmse = weight_compressed_mse
         self.w_stft = weight_stft
         self.w_energy = weight_energy
         self.w_logmel = weight_logmel
+        self.w_temporal = weight_temporal
 
         self.sisnr_loss = SISNRLoss()
         self.cmse_loss = CompressedMSELoss(compress_factor)
         self.stft_loss = MultiResSTFTLoss()
         self.energy_loss = EnergyPreservationLoss()
         self.logmel_loss = LogMelLoss()
+        self.temporal_loss = TemporalConsistencyLoss()
 
     def forward(self, pred_stft, target_stft,
                 pred_audio=None, target_audio=None):
@@ -377,6 +428,11 @@ class AuraNetV3Loss(nn.Module):
             loss_dict["multi_res_stft"] = torch.tensor(0.0, device=pred_stft.device)
             loss_dict["energy"] = torch.tensor(0.0, device=pred_stft.device)
             loss_dict["logmel"] = torch.tensor(0.0, device=pred_stft.device)
+
+        # Temporal consistency — reduces musical noise / frame jitter
+        l_temporal = self.temporal_loss(pred_stft, target_stft)
+        loss_dict["temporal"] = l_temporal
+        total = total + self.w_temporal * l_temporal
 
         loss_dict["total"] = total
         return total, loss_dict

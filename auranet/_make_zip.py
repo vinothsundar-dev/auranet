@@ -5,15 +5,17 @@ zip_path = os.path.expanduser("~/Desktop/auranet_project.zip")
 
 include_files = [
     "model.py", "model_optimized.py", "model_optimized_v2.py",
-    "model_v3.py", "loss.py", "loss_v3.py",
+    "model_v3.py", "loss.py", "loss_v3.py", "loss_perceptual.py",
     "dataset.py", "dataset_v3.py",
     "train.py", "train_v2.py", "train_v2_stable.py", "train_v3.py",
+    "train_finetune.py", "metrics.py",
     "infer.py", "infer_v3.py",
     "export.py", "export_v3.py",
     "config.yaml", "config_v3.yaml",
     "requirements.txt",
     "postprocessing.py", "profiling.py", "quantization.py", "validation.py",
     "quick_diagnostic.py",
+    "debug_training.py", "debug_loss_balance.py",  # Debug scripts
     "auranet_v2_complete.py", "auranet_v2_edge.py", "auranet_v2_optimized.py",
     "utils/__init__.py", "utils/audio_utils.py", "utils/stft.py",
     "deploy/benchmark.py", "deploy/convert_coreml.py",

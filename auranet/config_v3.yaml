@@ -31,9 +31,9 @@ loss:
 training:
   batch_size: 16
   num_epochs: 100
-  learning_rate: 0.001
+  learning_rate: 0.0001   # FIXED: 1e-4 for perceptual fine-tuning (was 0.001)
   weight_decay: 0.01
-  gradient_clip: 5.0
+  gradient_clip: 3.0      # FIXED: reduced from 5.0 for stability
   warmup_epochs: 5
   lr_patience: 5           # ReduceLROnPlateau patience
   early_stop_patience: 15
@@ -41,6 +41,16 @@ training:
   checkpoint_dir: checkpoints
   segment_length: 3.0
   num_synthetic_samples: 2000
+
+augmentation:
+  rir_prob: 0.3             # 30% get reverb (synthetic RIR: rooms, cars, offices)
+  codec_prob: 0.2           # 20% get full codec chain (lowpass+resample+quantize)
+  bandwidth_prob: 0.15      # 15% get standalone bandwidth limitation
+  clipping_prob: 0.05       # 5% get mic clipping simulation
+
+eval:
+  metrics: [si_snr, pesq, stoi]
+  pesq_every_n_epochs: 5    # PESQ/STOI computed every N epochs (expensive)
 
 export:
   onnx:
