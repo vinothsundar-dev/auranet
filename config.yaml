@@ -6,7 +6,7 @@
 # Audio settings
 audio:
   sample_rate: 16000          # Input sample rate (Hz)
-  
+
 # STFT settings (strictly causal)
 stft:
   window_size: 160            # 10ms at 16kHz
@@ -22,19 +22,19 @@ model:
     channels: [16, 32, 64, 128]  # Channel progression
     kernel_size: [3, 3]       # [time, freq] kernel
     stride: [1, 2]            # Downsample frequency only
-    
+
   # Temporal bottleneck (GRU)
   bottleneck:
     hidden_size: 256
     num_layers: 1
     dropout: 0.0
-    
+
   # Decoder settings (mirrors encoder)
   decoder:
     channels: [128, 64, 32, 16, 2]  # Output 2 channels for cIRM
     kernel_size: [3, 3]
     stride: [1, 2]
-    
+
   # Neural-WDRC sidechain
   wdrc:
     hidden_dims: [128, 64]
@@ -46,7 +46,7 @@ loss:
   multi_resolution_stft: 0.5
   loudness_envelope: 0.3
   temporal_coherence: 0.2
-  
+
   # Multi-resolution STFT loss settings
   stft_loss:
     fft_sizes: [512, 1024, 2048]
@@ -62,15 +62,15 @@ training:
   lr_scheduler: "cosine"      # cosine, step, plateau
   warmup_epochs: 5
   gradient_clip: 3.0       # FIXED: reduced for stability
-  
+
   # Mixed precision training
   use_amp: true
-  
+
   # Quantization-aware training
   qat:
     enabled: false
     start_epoch: 50           # Start QAT after this epoch
-    
+
   # Checkpointing
   save_every_n_epochs: 5
   checkpoint_dir: "checkpoints"
@@ -82,11 +82,11 @@ data:
   train_noise_dir: "data/train/noise"
   val_clean_dir: "data/val/clean"
   val_noise_dir: "data/val/noise"
-  
+
   # Data augmentation
   snr_range: [-5, 20]         # SNR range in dB for mixing
   segment_length: 3.0         # Audio segment length in seconds
-  
+
   # DataLoader
   num_workers: 4
   pin_memory: true
